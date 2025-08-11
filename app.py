@@ -31,7 +31,16 @@ def _load_sysprompt_file() -> str:
         import re as _re
         m = _re.search(r"```\n(.*?)```", text, flags=_re.DOTALL)
         if m:
-            return m.group(1).strip()
+            block = m.group(1).strip()
+            if 'integrated with the MCP tool server' in block:
+                return block
+        # fallback: find integration line anywhere
+        for line in text.splitlines():
+            if 'integrated with the MCP tool server' in line:
+                # return that line plus following 120 lines as context
+                idx = text.splitlines().index(line)
+                snippet = "\n".join(text.splitlines()[idx:idx+120])
+                return snippet.strip()
         return text.strip()
     except Exception:
         return "You are an autonomous browsing and data assistant integrated with the MCP tool server webtool-mcp. (fallback minimal prompt)"
