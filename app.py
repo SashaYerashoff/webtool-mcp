@@ -15,6 +15,8 @@ import re
 from urllib.parse import urljoin, urlparse, quote_plus
 from typing import cast  # added
 import os
+import threading
+from collections import deque, OrderedDict
 
 app = Flask(__name__)
 
@@ -354,6 +356,93 @@ def _sse_stream():
     while True:
         yield ": keep-alive\n\n"
         time.sleep(15)
+
+# ------------------------------------------------------------------
+# Caching & Rate Limiting (new)
+# ------------------------------------------------------------------
+
+_HTML_CACHE_TTL = int(os.getenv("WEBTOOL_CACHE_TTL", "300"))  # seconds
+_HTML_CACHE_MAX = int(os.getenv("WEBTOOL_HTML_CACHE_SIZE", "64"))
+_OUTLINE_CACHE_TTL = int(os.getenv("WEBTOOL_OUTLINE_CACHE_TTL", "300"))
+_FETCH_RATE_PER_MIN = int(os.getenv("WEBTOOL_FETCH_URL_RATE_PER_MIN", "60"))
+
+_html_cache_lock = threading.Lock()
+_outline_cache_lock = threading.Lock()
+
+class _LRUCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.data: OrderedDict[str, tuple[float, str]] = OrderedDict()
+
+    def get(self, key: str, ttl: int) -> str | None:
+        now = time.time()
+        with _html_cache_lock:
+            item = self.data.get(key)
+            if not item:
+                return None
+            ts, val = item
+            if now - ts > ttl:
+                del self.data[key]
+                return None
+            # move to end
+            self.data.move_to_end(key)
+            return val
+
+    def put(self, key: str, value: str):
+        with _html_cache_lock:
+            if key in self.data:
+                self.data.move_to_end(key)
+            self.data[key] = (time.time(), value)
+            while len(self.data) > self.capacity:
+                self.data.popitem(last=False)
+
+_html_cache = _LRUCache(_HTML_CACHE_MAX)
+_outline_cache = _LRUCache(_HTML_CACHE_MAX)
+
+_rate_lock = threading.Lock()
+_fetch_timestamps = deque()  # timestamps of fetch_url network fetches
+
+def _rate_limited_fetch_allowed() -> bool:
+    """Return True if another network fetch_url is allowed under rate limit."""
+    if _FETCH_RATE_PER_MIN <= 0:
+        return True
+    now = time.time()
+    window_start = now - 60
+    with _rate_lock:
+        # drop old
+        while _fetch_timestamps and _fetch_timestamps[0] < window_start:
+            _fetch_timestamps.popleft()
+        if len(_fetch_timestamps) >= _FETCH_RATE_PER_MIN:
+            return False
+        _fetch_timestamps.append(now)
+        return True
+
+def _cached_fetch_html(url: str) -> tuple[str | None, bool, str | None]:
+    """Return (html, cache_hit, error)."""
+    key = url.strip()
+    html = _html_cache.get(key, _HTML_CACHE_TTL)
+    if html is not None:
+        return html, True, None
+    # rate limiting only for real network fetches
+    if not _rate_limited_fetch_allowed():
+        return None, False, f"Rate limit exceeded: max {_FETCH_RATE_PER_MIN} fetch_url network requests per minute. Try later or rely on cached outline/chunks."
+    res = fetch_url(url)
+    if isinstance(res, dict) and res.get("error"):
+        return None, False, res["error"]
+    html = res.get("content", "")
+    if html:
+        _html_cache.put(key, html)
+    return html, False, None
+
+def _outline_cache_key(url: str) -> str:
+    return f"outline::{url.strip()}"
+
+def _get_cached_outline(url: str) -> str | None:
+    return _outline_cache.get(_outline_cache_key(url), _OUTLINE_CACHE_TTL)
+
+def _store_cached_outline(url: str, text: str):
+    _outline_cache.put(_outline_cache_key(url), text)
+    app.logger.debug(f"Stored outline cache for {url}")
 
 # ------------------------------------------------------------------
 # Structured page extraction (replaces earlier simple fallback)
@@ -811,12 +900,31 @@ def mcp_endpoint():
                 chunk_id = (arguments or {}).get("chunk_id") or (arguments or {}).get("section")
                 mode = (arguments or {}).get("mode")
                 link_id = (arguments or {}).get("link_id")
-                # Basic fetch
-                res = fetch_url(url)
-                if isinstance(res, dict) and res.get("error"):
-                    text = f"Error fetching URL: {res['error']}"
+                cache_status = []
+                # Use caches
+                html, html_cache_hit, html_error = _cached_fetch_html(url)
+                if html_error:
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": f"Error fetching URL: {html_error}"}]}))
+                if html_cache_hit:
+                    cache_status.append("html_hit")
+                # Outline cache applies only when outline mode and no chunk/link follow
+                if mode == 'outline' and not chunk_id and not link_id:
+                    cached_outline = _get_cached_outline(url)
+                    if cached_outline is not None:
+                        cache_status.append("outline_hit")
+                        text = cached_outline
+                        # annotate (reuse injection logic later)
+                        marker = "META\n"
+                        insertion = f"META\ncache_status: {','.join(cache_status)}\n"
+                        if marker in text:
+                            text2 = text.replace(marker, insertion, 1)
+                            text = text2
+                        else:
+                            text = insertion + text
+                        return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": text}]}))
+                if html is None:
+                    text = "Error: no HTML returned."  # should have been handled above
                 else:
-                    html = (res or {}).get("content", "")
                     # If link_id provided, perform single-hop follow
                     if link_id and not chunk_id:
                         try:
@@ -859,10 +967,30 @@ def mcp_endpoint():
                     else:
                         try:
                             text = format_structured_page(html, url, chunk_id=chunk_id, mode=mode)
+                            # Always attempt to store if outline mode (no chunk/link)
+                            if mode == 'outline' and not chunk_id and not link_id:
+                                _store_cached_outline(url, text)
                         except Exception as e:
                             app.logger.exception("format_structured_page failed")
                             trunc = html[:1200].replace('\n', ' ')
                             text = f"Parser error, fallback raw snippet. Error: {e}\nSource: {url}\nSnippet: {trunc}"
+                if cache_status:
+                    marker = "META\n"
+                    insertion = f"META\ncache_status: {','.join(cache_status)}\n"
+                    if marker in text:
+                        text2 = text.replace(marker, insertion, 1)
+                        if text2 == text:
+                            # fallback append after first line
+                            lines = text.splitlines()
+                            if lines and lines[0] == 'META':
+                                lines.insert(1, f"cache_status: {','.join(cache_status)}")
+                                text = "\n".join(lines)
+                            else:
+                                text = insertion + text
+                        else:
+                            text = text2
+                    else:
+                        text = insertion + text
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": text}]}))
             if name == "search_wikipedia":
                 query = (arguments or {}).get("query", "")
