@@ -21,30 +21,24 @@ from collections import deque, OrderedDict
 
 app = Flask(__name__)
 
-# System prompt with model guidance
-SYSTEM_PROMPT = """You are an autonomous browsing and data assistant. Tools available:
-- fetch_url(url, chunk_id?, section?, mode?='outline', link_id?). Use mode='outline' first to get structure cheaply. Only request specific sections (sec-#) or follow link ids (L#) that you actually need. Avoid refetching the same page unless mode/section differ. Single-hop link follow returns HISTORY + target page.
-- search_wikipedia(query) for concise background.
-- latvian_news(query?) for latest Latvian headlines or topic-specific headlines.
-- search_duckduckgo(query) for quick related topics when you lack a starting URL.
-- stock_quotes(symbols) for basic market data (not investment advice).
-Decision Guidance:
-1. When given a broad topic: use search_duckduckgo or search_wikipedia to ground terms, then fetch_url on the most relevant authoritative link.
-2. When given a specific URL: call fetch_url with mode='outline' first, inspect OUTLINE/LINKS, then drill into a needed section via chunk_id (sec-#) OR follow a promising link_id (L#). Do not request multiple large sections at once—iterate.
-3. For news monitoring (Latvia or topic): use latvian_news (optionally with a query). Only fetch individual articles if deeper detail is requested—then follow their link via fetch_url.
-4. Minimize token usage: prefer outline mode -> targeted chunk -> optional follow-up. Avoid reprocessing full page repeatedly.
-5. If an error occurs (network/parser), retry once with a simpler mode (outline) before giving up. Report the failing URL succinctly.
-6. Always cite the source URL(s) you used in your final answer.
-7. Financial data: use stock_quotes only when user explicitly asks about symbols; do not infer trades or give advice.
-Output Discipline:
-- Summaries should differentiate between source facts and your synthesis.
-- When combining multiple chunks/pages, list sources with their role.
-- If insufficient data gathered, state what next tool call would retrieve missing info.
-"""
+# System prompt loader (reads from sysprompt.md)
+_SYSPROMPT_PATH = os.path.join(os.path.dirname(__file__), 'sysprompt.md')
 
+def _load_sysprompt_file() -> str:
+    try:
+        with open(_SYSPROMPT_PATH, 'r', encoding='utf-8') as f:
+            text = f.read()
+        import re as _re
+        m = _re.search(r"```\n(.*?)```", text, flags=_re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        return text.strip()
+    except Exception:
+        return "You are an autonomous browsing and data assistant integrated with the MCP tool server webtool-mcp. (fallback minimal prompt)"
 
 def get_system_prompt() -> dict:
-    return {"prompt": SYSTEM_PROMPT, "version": "1.0"}
+    prompt = _load_sysprompt_file()
+    return {"prompt": prompt, "version": "1.1"}
 
 # ------------------------------------------------------------------
 # Helper functions
@@ -1095,7 +1089,10 @@ def mcp_endpoint():
     if function_name in ('initialize', 'list_tools', 'health', 'info'):
         result = available_functions_info()
         # Attach system prompt in legacy info for convenience
-        result["system_prompt_head"] = SYSTEM_PROMPT.splitlines()[:6]
+        try:
+            result["system_prompt_head"] = get_system_prompt()["prompt"].splitlines()[:6]
+        except Exception:
+            result["system_prompt_head"] = ["(failed to load system prompt)"]
         return jsonify({"response": result})
 
     # Dispatch to helper functions
