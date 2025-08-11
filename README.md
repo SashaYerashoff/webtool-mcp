@@ -13,7 +13,7 @@ Tools currently exposed:
 | `search_wikipedia` | Concise summary of a topic from Wikipedia REST API. |
 | `latvian_news` | Latest Latvian headlines (Google News RSS) or topic search. |
 | `search_duckduckgo` | Legacy single DuckDuckGo lookup (prefer `web_search`). |
-| `stock_quotes` | Basic market quote snapshot (unofficial Yahoo Finance). |
+| `ai_company_news` | Recent headlines per AI/tech company (OpenAI, Google, Anthropic, Microsoft, Nvidia). |
 | `get_system_prompt` | Returns the internal system prompt with usage guidance. |
 
 All tools are discoverable through the MCP `tools/list` (or `tools.list`) JSON-RPC method.

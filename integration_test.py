@@ -22,7 +22,7 @@ print("[1] tools/list")
 try:
     data = jrpc("tools/list", 1)
     tools = {t['name'] for t in data['result']['tools']}
-    assert 'fetch_url' in tools and 'quick_search' in tools, "Required tools missing"
+    assert {'fetch_url','quick_search','ai_company_news'}.issubset(tools), "Required tools missing"
     print("  tools ok (", ", ".join(sorted(list(tools))[:8]), ")")
 except Exception as e:
     failures.append(f"tools/list failed: {e}")
@@ -60,9 +60,19 @@ try:
 except Exception as e:
     failures.append(f"latvian_news failed: {e}")
 
+print("[5] ai_company_news")
+try:
+    acn = jrpc("tools/call", 6, {"name":"ai_company_news","arguments":{}})
+    txt = acn['result']['content'][0]['text']
+    payload = json.loads(txt)
+    assert payload.get('companies'), 'ai_company_news returned no companies field'
+    print("  ai_company_news companies:", ', '.join(list(payload['companies'].keys())[:5]))
+except Exception as e:
+    failures.append(f"ai_company_news failed: {e}")
+
 if failures:
     print("\nFAILURES:")
     for f in failures:
         print(" -", f)
     sys.exit(1)
-print("\nAll integration smoke tests passed (allowing latvian_news transient issues).")
+print("\nAll integration smoke tests passed (allowing news feed transient issues).")

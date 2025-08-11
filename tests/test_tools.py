@@ -16,7 +16,7 @@ def jrpc(method: str, id_: int, params: dict | None = None):
 def test_tools_list_contains_expected():
     data = jrpc("tools/list", 1)
     names = {t['name'] for t in data['result']['tools']}
-    for expected in ["fetch_url","quick_search","web_search","latvian_news","search_wikipedia"]:
+    for expected in ["fetch_url","quick_search","web_search","latvian_news","search_wikipedia","ai_company_news"]:
         assert expected in names
 
 
@@ -41,3 +41,9 @@ def test_web_search_multi_subset():
     payload = json.loads(data['result']['content'][0]['text'])
     assert payload.get('engine') == 'multi'
     assert 'duckduckgo' in payload.get('results', {})
+
+
+def test_ai_company_news():
+    data = jrpc("tools/call", 6, {"name":"ai_company_news","arguments":{}})
+    payload = json.loads(data['result']['content'][0]['text'])
+    assert payload.get('companies')

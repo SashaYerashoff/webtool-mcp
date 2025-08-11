@@ -271,36 +271,43 @@ def quick_search(query: str) -> dict:
     return {"query": query, "engine": "bing", "results": r2.get("results"), "source": "quick_search"}
 
 
-def stock_quotes(symbols: list[str] | str) -> dict:
-    """Fetch simple stock quote data via Yahoo Finance unofficial endpoint."""
-    if isinstance(symbols, str):
-        # split by comma/whitespace
-        raw = re.split(r"[\s,]+", symbols.strip()) if symbols.strip() else []
-        symbols_list = [s.upper() for s in raw if s]
+def ai_company_news(companies: list[str] | str | None = None, limit: int = 5, locale: str = "en-US", region: str = "US") -> dict:
+    """Aggregate recent news headlines per AI/tech company using Google News RSS.
+
+    Default companies: OpenAI, Google, Anthropic, Microsoft, Nvidia.
+    Returns: { company: [ {title,url,published} ] }
+    """
+    if companies is None or (isinstance(companies, str) and not companies.strip()):
+        companies_list = ["OpenAI", "Google", "Anthropic", "Microsoft", "Nvidia"]
+    elif isinstance(companies, str):
+        companies_list = [c.strip() for c in re.split(r"[\s,]+", companies) if c.strip()]
     else:
-        symbols_list = [s.upper() for s in symbols if s]
-    if not symbols_list:
-        return {"error": "No symbols provided"}
-    api_url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    try:
-        resp = requests.get(api_url, params={"symbols": ",".join(symbols_list)}, timeout=8)
-        resp.raise_for_status()
-        data = resp.json()
-        result = []
-        for quote in data.get("quoteResponse", {}).get("result", []):
-            result.append({
-                "symbol": quote.get("symbol"),
-                "name": quote.get("shortName") or quote.get("longName"),
-                "price": quote.get("regularMarketPrice"),
-                "change_percent": quote.get("regularMarketChangePercent"),
-                "currency": quote.get("currency"),
-                "previous_close": quote.get("regularMarketPreviousClose"),
-                "day_range": quote.get("regularMarketDayRange"),
-                "market_state": quote.get("marketState"),
-            })
-        return {"quotes": result, "requested": symbols_list, "source": "Yahoo Finance (unofficial)"}
-    except requests.RequestException as exc:
-        return {"error": f"Stock quote fetch failed: {exc}"}
+        companies_list = [c for c in companies if c]
+    out: dict[str, list[dict]] = {}
+    errors: dict[str, str] = {}
+    for company in companies_list:
+        q = quote_plus(company)
+        rss_url = f"https://news.google.com/rss/search?q={q}&hl={locale}&gl={region}&ceid={region}:{locale.split('-')[0]}"
+        try:
+            resp = requests.get(rss_url, timeout=10)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.content)
+            items = []
+            for item in root.findall('.//item'):
+                title = (item.findtext('title') or '').strip()
+                link = (item.findtext('link') or '').strip()
+                pub_date = (item.findtext('pubDate') or '').strip()
+                if title and link:
+                    items.append({"title": title, "url": link, "published": pub_date})
+                if len(items) >= limit:
+                    break
+            out[company] = items
+        except Exception as e:
+            errors[company] = str(e)
+    result: dict[str, object] = {"companies": out, "source": "Google News RSS", "limit": limit}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def latvian_news(query: str | None = None, limit: int = 10) -> dict:
@@ -340,7 +347,7 @@ def available_functions_info() -> dict:
             "search_wikipedia": {"args": {"query": "string"}},
             "latvian_news": {"args": {"query": "string?"}},
             "search_duckduckgo": {"args": {"query": "string"}},
-            "stock_quotes": {"args": {"symbols": "string|list"}},
+            "ai_company_news": {"args": {"companies": "string|list?", "limit": "int?"}},
             "get_system_prompt": {"args": {}},
         },
         "usage": [
@@ -353,7 +360,7 @@ def available_functions_info() -> dict:
             {"name": "latvian_news", "arguments": {"query": "tehnoloģijas"}},
             {"name": "search_duckduckgo", "arguments": {"query": "open source vector database"}},
             {"name": "quick_search", "arguments": {"query": "quick test query"}},
-            {"name": "stock_quotes", "arguments": {"symbols": "AAPL, MSFT"}},
+            {"name": "ai_company_news", "arguments": {}},
             {"name": "get_system_prompt", "arguments": {}},
         ],
     }
@@ -896,12 +903,14 @@ def mcp_endpoint():
                     },
                 },
                 {
-                    "name": "stock_quotes",
-                    "description": "Fetch basic stock quotes for one or multiple symbols.",
+                    "name": "ai_company_news",
+                    "description": "Recent news headlines per AI/tech company (OpenAI, Google, Anthropic, Microsoft, Nvidia by default).",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {"symbols": {"type": "string", "description": "Comma or space separated symbols, e.g. AAPL MSFT"}},
-                        "required": ["symbols"],
+                        "properties": {
+                            "companies": {"type": "string", "description": "Optional comma/space separated company names"},
+                            "limit": {"type": "number", "description": "Headlines per company (default 5)"}
+                        }
                     },
                 },
                 {
@@ -1060,9 +1069,10 @@ def mcp_endpoint():
                 query = (arguments or {}).get("query", "")
                 res = quick_search(query)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
-            if name == "stock_quotes":
-                symbols = (arguments or {}).get("symbols", "")
-                res = stock_quotes(symbols)
+            if name == "ai_company_news":
+                companies = (arguments or {}).get("companies")
+                limit = (arguments or {}).get("limit", 5)
+                res = ai_company_news(companies, limit=limit)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "get_system_prompt":
                 prm = get_system_prompt()
