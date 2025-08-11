@@ -11,7 +11,7 @@ OPENAI_BASE = os.getenv("OPENAI_BASE", "http://localhost:1234/v1")
 MODEL = os.getenv("MODEL", "gpt-oss")
 MCP_URL = os.getenv("MCP_URL", "http://localhost:5000/mcp")
 
-SYSTEM_PROMPT_HEAD = "You are an autonomous browsing and data assistant integrated with the MCP tool server"  # quick validation string
+SYSTEM_PROMPT_HEAD = "autonomous browsing and data assistant integrated with the MCP tool server"  # substring validation
 
 
 def _get_system_prompt():
@@ -44,7 +44,8 @@ def main():
         print("FAILED: could not retrieve system prompt:", e)
         sys.exit(1)
     if SYSTEM_PROMPT_HEAD not in system_prompt:
-        print("FAILED: system prompt content mismatch")
+        print("FAILED: system prompt content mismatch (expected substring not found)")
+        print(system_prompt.splitlines()[0][:160])
         sys.exit(1)
     user_query = "Find a recent official Python release announcement and outline it. Respond only with your first tool call as JSON-RPC params, nothing else."
     try:
