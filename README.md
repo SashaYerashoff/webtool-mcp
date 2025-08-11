@@ -9,10 +9,11 @@ Tools currently exposed:
 
 | Tool | Purpose |
 |------|---------|
-| `fetch_url` | Fetch & parse a webpage. Supports: outline-only mode, per‑section (chunk) retrieval, single‑hop link follow (`link_id`), or focused chunk view. Returns META / OUTLINE / LINKS / CHUNKS / (optionally CHUNK / KEYPOINTS / ENTITIES etc.). |
+| `fetch_url` | Fetch & parse a webpage. Outline-only mode, per‑section retrieval, single‑hop link follow (`link_id`), or focused chunk view. |
+| `web_search` | Multi-engine search (duckduckgo, bing, google_cse, multi aggregate). |
 | `search_wikipedia` | Concise summary of a topic from Wikipedia REST API. |
 | `latvian_news` | Latest Latvian headlines (Google News RSS) or topic search. |
-| `search_duckduckgo` | DuckDuckGo Instant Answer + related links to bootstrap browsing. |
+| `search_duckduckgo` | Legacy single DuckDuckGo lookup (prefer `web_search`). |
 | `stock_quotes` | Basic market quote snapshot (unofficial Yahoo Finance). |
 | `get_system_prompt` | Returns the internal system prompt with usage guidance. |
 
@@ -94,32 +95,21 @@ Change the `app.run(... port=5000)` line or export `PORT` and modify code to rea
 
 Ask the model: "List the tools you have." It should respond (or you can request a `tools/list` internally) with the tools defined above.
 
-## System Prompt (You Can Paste This Into Your Model Setup)
+## System Prompt
 
-```
-You are an autonomous browsing and data assistant. Tools available:
-- fetch_url(url, chunk_id?, section?, mode?='outline', link_id?). Use mode='outline' first to get structure cheaply. Only request specific sections (sec-#) or follow link ids (L#) that you actually need. Avoid refetching the same page unless mode/section differ. Single-hop link follow returns HISTORY + target page.
-- search_wikipedia(query) for concise background.
-- latvian_news(query?) for latest Latvian headlines or topic-specific headlines.
-- search_duckduckgo(query) for quick related topics when you lack a starting URL.
-- stock_quotes(symbols) for basic market data (not investment advice).
-Decision Guidance:
-1. When given a broad topic: use search_duckduckgo or search_wikipedia to ground terms, then fetch_url on the most relevant authoritative link.
-2. When given a specific URL: call fetch_url with mode='outline' first, inspect OUTLINE/LINKS, then drill into a needed section via chunk_id (sec-#) OR follow a promising link_id (L#). Do not request multiple large sections at once—iterate.
-3. For news monitoring (Latvia or topic): use latvian_news (optionally with a query). Only fetch individual articles if deeper detail is requested—then follow their link via fetch_url.
-4. Minimize token usage: prefer outline mode -> targeted chunk -> optional follow-up. Avoid reprocessing full page repeatedly.
-5. If an error occurs (network/parser), retry once with a simpler mode (outline) before giving up. Report the failing URL succinctly.
-6. Always cite the source URL(s) you used in your final answer.
-7. Financial data: use stock_quotes only when user explicitly asks about symbols; do not infer trades or give advice.
-Output Discipline:
-- Summaries should differentiate between source facts and your synthesis.
-- When combining multiple chunks/pages, list sources with their role.
-- If insufficient data gathered, state what next tool call would retrieve missing info.
-```
+See `sysprompt.md` for the fully maintained prompt (ranking heuristics, fallbacks, efficiency rules). Minimal inline guidance:
+
+> Broad topic → `web_search` (multi) → choose URL → `fetch_url(mode='outline')` → pick `chunk_id` OR `link_id` → summarize with cited sources before deeper retrieval.
 
 ## Manual Testing (curl examples)
 
 Fetch outline only (cheap):
+Web search (multi-engine aggregate):
+```bash
+curl -s -X POST http://localhost:5000/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"web_search","arguments":{"query":"open source vector databases","engine":"multi","engines":["duckduckgo","bing"],"max_results":5}}'
+```
 ```bash
 curl -s -X POST http://localhost:5000/mcp \
   -H 'Content-Type: application/json' \
@@ -148,6 +138,44 @@ curl -s -X POST http://localhost:5000/mcp \
 ```
 
 Latvian news:
+## Google Custom Search (Optional)
+
+To enable the `google_cse` engine inside `web_search`, export environment variables prior to launch:
+
+```bash
+export GOOGLE_API_KEY="your_api_key"
+export GOOGLE_CSE_ID="your_cse_id"   # Programmable Search Engine ID
+python app.py
+```
+
+Then call (example):
+```json
+{"name":"web_search","arguments":{"query":"vector db benchmarks","engine":"google_cse","max_results":5}}
+```
+
+## Search Strategy & Fallbacks
+
+- Ambiguous / exploratory: `web_search` with `engine="multi"` and `engines=["duckduckgo","bing"]`.
+- Weak results: refine query (add distinguishing noun, remove stopwords) or switch engine.
+- After outline: rank links (authority > freshness > relevance) and follow only one `link_id` per step.
+- Avoid re-fetching the same outline unless stale.
+- Parsing issue: retry once with `mode='outline'` then choose alternate source.
+
+## JSON-RPC Tool Call Examples
+
+Payloads MCP client sends (wrapping examples):
+
+```jsonc
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fetch_url","arguments":{"url":"https://example.com","mode":"outline"}}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch_url","arguments":{"url":"https://example.com","chunk_id":"sec-2"}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"fetch_url","arguments":{"url":"https://example.com","link_id":"L5"}}}
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"open source vector database","engine":"multi","engines":["duckduckgo","bing"],"max_results":5}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"web_search","arguments":{"query":"vector db benchmarks","engine":"google_cse","max_results":5}}}
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"latvian_news","arguments":{}}}
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_wikipedia","arguments":{"query":"Milvus"}}}
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"stock_quotes","arguments":{"symbols":"AAPL MSFT"}}}
+```
 ```bash
 curl -s -X POST http://localhost:5000/mcp \
   -H 'Content-Type: application/json' \
