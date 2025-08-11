@@ -81,7 +81,8 @@ def search_wikipedia(query: str) -> dict:
 def search_duckduckgo(query: str, max_results: int = 5) -> dict:
     """Improved DuckDuckGo search.
     1) Try duckduckgo_search library for organic results.
-    2) Fallback to Instant Answer API (may be sparse for long-tail queries).
+    2) Fallback to lightweight HTML scrape.
+    3) Finally fallback to Instant Answer API (may be sparse for long-tail queries).
     """
     if not query:
         return {"error": "Empty query"}
@@ -251,6 +252,21 @@ def web_search(query: str, engine: str = "duckduckgo", max_results: int = 5, eng
     return {"error": f"Unsupported engine '{engine}'", "supported": ["duckduckgo", "bing", "google_cse", "multi"]}
 
 
+def quick_search(query: str) -> dict:
+    """Fast lightweight search (duckduckgo first, fallback to bing) limited to 3 results.
+    Intended for initial scoping before deeper multi-engine exploration.
+    """
+    if not query:
+        return {"error": "Empty query"}
+    r = web_search(query, engine="duckduckgo", max_results=3)
+    results = r.get("results") or []
+    if isinstance(results, list) and results:
+        return {"query": query, "engine": "duckduckgo", "results": results, "source": "quick_search"}
+    # fallback single bing
+    r2 = web_search(query, engine="bing", max_results=3)
+    return {"query": query, "engine": "bing", "results": r2.get("results"), "source": "quick_search"}
+
+
 def stock_quotes(symbols: list[str] | str) -> dict:
     """Fetch simple stock quote data via Yahoo Finance unofficial endpoint."""
     if isinstance(symbols, str):
@@ -332,6 +348,7 @@ def available_functions_info() -> dict:
             {"name": "latvian_news", "arguments": {}},
             {"name": "latvian_news", "arguments": {"query": "tehnoloģijas"}},
             {"name": "search_duckduckgo", "arguments": {"query": "open source vector database"}},
+            {"name": "quick_search", "arguments": {"query": "quick test query"}},
             {"name": "stock_quotes", "arguments": {"symbols": "AAPL, MSFT"}},
             {"name": "get_system_prompt", "arguments": {}},
         ],
@@ -866,6 +883,15 @@ def mcp_endpoint():
                     },
                 },
                 {
+                    "name": "quick_search",
+                    "description": "Fast small-result search (duckduckgo→bing fallback) max 3 results for scoping.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string", "description": "Search phrase"}},
+                        "required": ["query"],
+                    },
+                },
+                {
                     "name": "stock_quotes",
                     "description": "Fetch basic stock quotes for one or multiple symbols.",
                     "inputSchema": {
@@ -1025,6 +1051,10 @@ def mcp_endpoint():
                 max_results = (arguments or {}).get("max_results", 5)
                 engines = (arguments or {}).get("engines")
                 res = web_search(query, engine=engine, max_results=max_results, engines=engines)
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
+            if name == "quick_search":
+                query = (arguments or {}).get("query", "")
+                res = quick_search(query)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "stock_quotes":
                 symbols = (arguments or {}).get("symbols", "")
