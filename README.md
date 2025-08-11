@@ -1,4 +1,3 @@
-git clone https://github.com/yourusername/webtool.git   # replace with your URL
 # WebTool MCP Server (webtool-mcp)
 
 Browser & info access helper for local LLMs via the **Model Context Protocol (MCP)**. Exposes a single HTTP JSON-RPC endpoint LM Studio (and other MCP clients) can call. Optimized for iterative, low‑token browsing: outline first → selective drill‑down → optional link follow.
@@ -210,7 +209,15 @@ This is a demo / local helper:
 
 ## License
 
-Add a license of your choice (MIT recommended) – currently unlicensed.
+Licensed under the MIT License – see `LICENSE`.
+
+Dependency license compatibility (all permissive / MIT‑compatible):
+- Flask (BSD-3-Clause)
+- Requests (Apache-2.0)
+- BeautifulSoup4 / bs4 (MIT)
+- duckduckgo-search (MIT)
+
+No copyleft or restrictive GPL dependencies are included, so MIT distribution is appropriate.
 
 ---
 Happy browsing with your local models! 🧭
