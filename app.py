@@ -14,6 +14,7 @@ from bs4 import NavigableString
 import re
 from urllib.parse import urljoin, urlparse, quote_plus
 from typing import cast  # added
+import os
 
 app = Flask(__name__)
 
@@ -76,17 +77,63 @@ def search_wikipedia(query: str) -> dict:
 
 
 def search_duckduckgo(query: str, max_results: int = 5) -> dict:
-    """DuckDuckGo Instant Answer search (no tracking)."""
+    """Improved DuckDuckGo search.
+    1) Try duckduckgo_search library for organic results.
+    2) Fallback to Instant Answer API (may be sparse for long-tail queries).
+    """
     if not query:
         return {"error": "Empty query"}
+    results = []
+    # Attempt library (organic results)
+    try:
+        from duckduckgo_search import DDGS  # type: ignore
+        with DDGS() as ddgs:  # context manager handles cookies
+            for r in ddgs.text(query, max_results=max_results):
+                if not isinstance(r, dict):
+                    continue
+                title = r.get("title") or r.get("heading")
+                url = r.get("href") or r.get("url")
+                snippet = r.get("body") or r.get("abstract")
+                if title and url:
+                    results.append({"title": title, "url": url, "snippet": snippet})
+        if results:
+            return {
+                "query": query,
+                "engine": "duckduckgo",
+                "results": results,
+                "source": "duckduckgo_search library",
+            }
+    except ImportError:
+        pass  # fallback below
+    except Exception as exc:
+        # Non-fatal; include note and fallback
+        fallback_note = f"organic_error: {exc}"[:180]
+    # If library failed or empty, attempt lightweight HTML scraping (best-effort; may break)
+    if not results:
+        try:
+            r = requests.get("https://duckduckgo.com/html/", params={"q": query}, timeout=10, headers={"User-Agent": "Mozilla/5.0 webtool-mcp"})
+            r.raise_for_status()
+            s = BeautifulSoup(r.text, 'html.parser')
+            for a in s.select('a.result__a'):
+                title = _collapse(a.get_text(' '))[:240]
+                href = a.get('href')
+                snippet_tag = a.find_parent('div', class_='result__body')
+                snippet = ''
+                if snippet_tag:
+                    sn = snippet_tag.select_one('.result__snippet')
+                    if sn:
+                        snippet = _collapse(sn.get_text(' '))[:400]
+                if title and href:
+                    results.append({"title": title, "url": href, "snippet": snippet})
+                if len(results) >= max_results:
+                    break
+            if results:
+                return {"query": query, "engine": "duckduckgo_html", "results": results, "source": "duckduckgo html scrape"}
+        except Exception:
+            pass
+    # Fallback to Instant Answer
     url = "https://api.duckduckgo.com/"
-    params = {
-        "q": query,
-        "format": "json",
-        "no_html": 1,
-        "skip_disambig": 1,
-        "t": "webtool-mcp",
-    }
+    params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1, "t": "webtool-mcp"}
     try:
         resp = requests.get(url, params=params, timeout=7)
         resp.raise_for_status()
@@ -99,23 +146,107 @@ def search_duckduckgo(query: str, max_results: int = 5) -> dict:
                 txt = topic.get("Text")
                 first_url = topic.get("FirstURL")
                 if txt and first_url:
-                    related.append({"text": txt, "url": first_url})
-            elif isinstance(topic, list) and topic:
-                t0 = topic[0]
-                if isinstance(t0, dict):
-                    txt = t0.get("Text")
-                    first_url = t0.get("FirstURL")
-                    if txt and first_url:
-                        related.append({"text": txt, "url": first_url})
-        return {
-            "query": query,
-            "heading": heading,
-            "abstract": abstract,
-            "related": related,
-            "source": "DuckDuckGo Instant Answer",
-        }
+                    related.append({"title": txt, "url": first_url})
+        payload = {"query": query, "engine": "duckduckgo_instant", "heading": heading, "abstract": abstract, "related": related, "source": "DuckDuckGo Instant Answer"}
+        if not abstract and not related:
+            payload["note"] = "Instant Answer returned minimal data; consider alternate engine via web_search tool."
+        return payload
     except requests.RequestException as exc:
         return {"error": f"DuckDuckGo request failed: {exc}"}
+
+
+def web_search(query: str, engine: str = "duckduckgo", max_results: int = 5, engines: list[str] | None = None) -> dict:
+    """Unified multi-engine web search.
+
+    Supported engines:
+      - duckduckgo (library for organic results)
+      - bing (HTML scrape lightweight; may be brittle)
+      - google_cse (requires env GOOGLE_API_KEY + GOOGLE_CSE_ID)
+      - multi (provide list via engines=[...])
+    """
+    if not query:
+        return {"error": "Empty query"}
+    engine = (engine or "duckduckgo").lower()
+
+    def _bing(q: str) -> list[dict]:
+        search_url = "https://www.bing.com/search"
+        try:
+            r = requests.get(search_url, params={"q": q}, timeout=10, headers={"User-Agent": "Mozilla/5.0 webtool-mcp"})
+            r.raise_for_status()
+            s = BeautifulSoup(r.text, "html.parser")
+            out = []
+            for li in s.select("li.b_algo"):
+                a = li.select_one("h2 a")
+                if not a or not a.get("href"):
+                    continue
+                title = _collapse(a.get_text(" "))[:240]
+                url2 = a.get("href")
+                snippet_tag = li.select_one("p") or li.select_one("div.b_caption p")
+                snippet = _collapse(snippet_tag.get_text(" "))[:400] if snippet_tag else ""
+                if title and url2:
+                    out.append({"title": title, "url": url2, "snippet": snippet})
+                if len(out) >= max_results:
+                    break
+            return out
+        except Exception as e:
+            return [{"error": f"bing_fetch_failed: {e}"}]
+
+    def _google_cse(q: str) -> list[dict]:
+        key = os.environ.get("GOOGLE_API_KEY")
+        cx = os.environ.get("GOOGLE_CSE_ID")
+        if not key or not cx:
+            return [{"error": "Missing GOOGLE_API_KEY or GOOGLE_CSE_ID env vars"}]
+        try:
+            resp = requests.get("https://www.googleapis.com/customsearch/v1", params={"key": key, "cx": cx, "q": q, "num": min(max_results, 10)}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("items") or []
+            out = []
+            for it in items[:max_results]:
+                title = it.get("title")
+                link = it.get("link")
+                snippet = it.get("snippet")
+                if title and link:
+                    out.append({"title": title, "url": link, "snippet": snippet})
+            return out
+        except Exception as e:
+            return [{"error": f"google_cse_failed: {e}"}]
+
+    def _duck(q: str) -> list[dict]:
+        r = search_duckduckgo(q, max_results=max_results)
+        if r.get("results"):
+            return r["results"]  # type: ignore
+        # Fallback transform of instant answer "related"
+        rel = r.get("related") or []
+        out = []
+        for it in rel:
+            title = it.get("title") or it.get("text")
+            url2 = it.get("url")
+            if title and url2:
+                out.append({"title": title, "url": url2, "snippet": r.get("abstract") or ""})
+        return out
+
+    if engine == "multi":
+        selected = engines or ["duckduckgo", "bing"]
+        aggregate = {}
+        for eng in selected:
+            if eng == "duckduckgo":
+                aggregate[eng] = _duck(query)
+            elif eng == "bing":
+                aggregate[eng] = _bing(query)
+            elif eng == "google_cse":
+                aggregate[eng] = _google_cse(query)
+            else:
+                aggregate[eng] = [{"error": "unsupported_engine"}]
+        return {"query": query, "engine": "multi", "results": aggregate, "source": "web_search"}
+
+    if engine == "duckduckgo":
+        return {"query": query, "engine": engine, "results": _duck(query), "source": "web_search"}
+    if engine == "bing":
+        return {"query": query, "engine": engine, "results": _bing(query), "source": "web_search"}
+    if engine == "google_cse":
+        return {"query": query, "engine": engine, "results": _google_cse(query), "source": "web_search"}
+    return {"error": f"Unsupported engine '{engine}'", "supported": ["duckduckgo", "bing", "google_cse", "multi"]}
 
 
 def stock_quotes(symbols: list[str] | str) -> dict:
@@ -632,6 +763,20 @@ def mcp_endpoint():
                     },
                 },
                 {
+                    "name": "web_search",
+                    "description": "Multi-engine web search (duckduckgo, bing, google_cse, multi). Returns structured result list.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "engine": {"type": "string", "enum": ["duckduckgo", "bing", "google_cse", "multi"], "description": "Search engine (default duckduckgo)"},
+                            "max_results": {"type": "number", "description": "Max results per engine (default 5)"},
+                            "engines": {"type": "array", "items": {"type": "string"}, "description": "When engine=multi specify engines subset"}
+                        },
+                        "required": ["query"],
+                    },
+                },
+                {
                     "name": "stock_quotes",
                     "description": "Fetch basic stock quotes for one or multiple symbols.",
                     "inputSchema": {
@@ -745,6 +890,13 @@ def mcp_endpoint():
             if name == "search_duckduckgo":
                 query = (arguments or {}).get("query", "")
                 res = search_duckduckgo(query)
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
+            if name == "web_search":
+                query = (arguments or {}).get("query", "")
+                engine = (arguments or {}).get("engine", "duckduckgo")
+                max_results = (arguments or {}).get("max_results", 5)
+                engines = (arguments or {}).get("engines")
+                res = web_search(query, engine=engine, max_results=max_results, engines=engines)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "stock_quotes":
                 symbols = (arguments or {}).get("symbols", "")
