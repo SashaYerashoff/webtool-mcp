@@ -49,5 +49,5 @@ You may call at most one new heavy content retrieval (fetch_url without chunk_id
 ```
 
 ---
-Revision: 1.0 (multi-engine + ranking guidance)
+Revision: 1.1 (added SPDX note, tool call formatting clarification, latvian_news empty query guidance)
 Feel free to adapt for your local policies.

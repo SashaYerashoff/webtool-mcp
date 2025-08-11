@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """
 Flask MCP server fetch any URL, Wikipedia summary or Latvian news.
 """
