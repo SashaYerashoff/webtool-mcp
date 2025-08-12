@@ -14,6 +14,7 @@ Available tools (names only; LM Studio wraps calls automatically):
 - latvian_news(query?)
 - ai_company_news(companies?, limit?)
 - get_system_prompt()
+- site_search(site, term, engine?='duckduckgo'|'bing'|'google_cse'|'multi', max_results?, engines?)  # site:domain term convenience
 
 Tool Call Format (critical – prevents parsing errors):
 When you decide to invoke a tool, output ONLY a single JSON object (no prose, no backticks, no angle tokens) of the form:
@@ -69,5 +70,5 @@ You may call at most one new heavy content retrieval (fetch_url without chunk_id
 ```
 
 ---
-Revision: 1.2 (quick_search added, caching guidance, PDF handling, ai_company_news clarified, refined fallback & output rules)
+Revision: 1.3 (added site_search convenience; clarified web_search leniency when query key absent)
 Feel free to adapt for your local policies.

@@ -47,7 +47,7 @@ def _load_sysprompt_file() -> str:
 
 def get_system_prompt() -> dict:
     prompt = _load_sysprompt_file()
-    return {"prompt": prompt, "version": "1.1"}
+    return {"prompt": prompt, "version": "1.3"}
 
 # ------------------------------------------------------------------
 # Helper functions
@@ -889,8 +889,22 @@ def mcp_endpoint():
                             "engine": {"type": "string", "enum": ["duckduckgo", "bing", "google_cse", "multi"], "description": "Search engine (default duckduckgo)"},
                             "max_results": {"type": "number", "description": "Max results per engine (default 5)"},
                             "engines": {"type": "array", "items": {"type": "string"}, "description": "When engine=multi specify engines subset"}
+                        }
+                    },
+                },
+                {
+                    "name": "site_search",
+                    "description": "Convenience wrapper: site-specific search (builds site:domain query then calls web_search).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "site": {"type": "string", "description": "Domain like example.com (no protocol)"},
+                            "term": {"type": "string", "description": "Search term / phrase"},
+                            "engine": {"type": "string", "enum": ["duckduckgo", "bing", "google_cse", "multi"], "description": "Search engine (default duckduckgo)"},
+                            "max_results": {"type": "number", "description": "Max results (default 5)"},
+                            "engines": {"type": "array", "items": {"type": "string"}, "description": "When engine=multi specify engines subset"}
                         },
-                        "required": ["query"],
+                        "required": ["site", "term"]
                     },
                 },
                 {
@@ -1059,11 +1073,32 @@ def mcp_endpoint():
                 res = search_duckduckgo(query)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "web_search":
-                query = (arguments or {}).get("query", "")
+                # Fallback inference: accept 'q' or first stray string value if 'query' missing
+                query = (arguments or {}).get("query") or (arguments or {}).get("q") or ""
+                if not query and isinstance(arguments, dict):
+                    for k, v in arguments.items():
+                        if k not in {"engine", "max_results", "engines"} and isinstance(v, str) and v.strip():
+                            query = v.strip()
+                            break
                 engine = (arguments or {}).get("engine", "duckduckgo")
                 max_results = (arguments or {}).get("max_results", 5)
                 engines = (arguments or {}).get("engines")
                 res = web_search(query, engine=engine, max_results=max_results, engines=engines)
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
+            if name == "site_search":
+                site = (arguments or {}).get("site", "").strip()
+                term = (arguments or {}).get("term", "").strip()
+                engine = (arguments or {}).get("engine", "duckduckgo")
+                max_results = (arguments or {}).get("max_results", 5)
+                engines = (arguments or {}).get("engines")
+                if not site or not term:
+                    res = {"error": "site and term required"}
+                else:
+                    domain = site.replace("http://", "").replace("https://", "").split("/")[0]
+                    query = f"site:{domain} {term}".strip()
+                    res = web_search(query, engine=engine, max_results=max_results, engines=engines)
+                    res["site"] = domain
+                    res["original_term"] = term
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "quick_search":
                 query = (arguments or {}).get("query", "")
