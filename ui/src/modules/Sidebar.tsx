@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { fetchModels } from '../services/api';
+import { fetchModels } from './services/api';
 
 interface SidebarProps {
   onToggleTheme(): void;
