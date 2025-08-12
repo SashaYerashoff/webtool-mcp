@@ -1,0 +1,3 @@
+## Aggregated dependencies (server + backend proxy)
+-r requirements.txt
+-r backend/requirements.txt

@@ -35,6 +35,14 @@ pip install -r requirements.txt
 python app.py  # serves on http://0.0.0.0:5000 (http://localhost:5000)
 ```
 
+If you encounter `error: externally-managed-environment` (PEP 668) when running `pip install`, you're attempting a system-wide install. Always create and activate a virtual environment first:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+```
+Then proceed with dependency installation. Avoid using `--break-system-packages` unless you fully accept system Python modifications.
+
 Keep the process running (e.g. with `tmux`, `screen`, or a systemd service) if you want persistent availability.
 
 ### Quick Start (Windows 10/11 PowerShell)
@@ -89,6 +97,51 @@ Change the `app.run(... port=5000)` line or export `PORT` and modify code to rea
 
 4. Save and click Reload MCPs (or restart LM Studio).
 5. Open a chat with your local model. The tools should appear in the UI or be callable automatically.
+
+## Backend Proxy & Web UI (Experimental)
+
+Included extras:
+- `backend/` FastAPI proxy: mediates LM Studio + MCP tools, detects tool JSON.
+- `ui/` React + Vite interface.
+
+### Run All Components (3 terminals)
+Terminal 1 (MCP server):
+```bash
+make install
+make run-mcp
+```
+
+Terminal 2 (Proxy):
+```bash
+make install-backend
+make run-backend  # http://localhost:7000
+```
+
+Terminal 3 (UI):
+```bash
+cd ui
+npm install
+npm run dev  # http://localhost:5173
+```
+
+Configure endpoints before starting proxy if non-default:
+```bash
+export LM_STUDIO_BASE=http://localhost:1234
+export WEBTOOL_MCP_BASE=http://localhost:5000/mcp
+```
+
+### Session Flow
+1. User message → proxy `/chat`.
+2. Proxy sends full history to LM Studio.
+3. Assistant JSON tool call? Proxy invokes MCP tool and appends output.
+4. UI shows assistant + tool messages sequentially.
+
+### Roadmap (UI/Proxy)
+- WebSocket streaming (partial tokens + tool anticipation).
+- Local session history & persistence.
+- Tool output folding + JSON highlighting.
+- Auth + rate limiting for remote hosting.
+- System prompt version selector & diff viewer.
 
 ### Verifying from LM Studio
 
