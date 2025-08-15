@@ -5,6 +5,7 @@ import { H1 } from './ui';
 
 export default function App() {
   const [dark, setDark] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [model, setModel] = useState<string | null>('');
   const [systemPrompt, setSystemPrompt] = useState<string>('');
@@ -16,8 +17,9 @@ export default function App() {
   }
   return (
     <div className={dark ? 'dark' : ''}>
-  <div className="flex h-screen w-full bg-paper-50 text-ink-900 dark:bg-ink-900 dark:text-paper-100 transition-colors">
+      <div className="flex h-screen w-full bg-paper-50 text-ink-900 dark:bg-ink-900 dark:text-paper-100 transition-colors">
         <Sidebar
+          collapsed={!sidebarOpen}
           onToggleTheme={() => setDark(d=>!d)}
           onNewChat={handleNewChat}
           model={model}
@@ -25,9 +27,12 @@ export default function App() {
           systemPrompt={systemPrompt}
           setSystemPrompt={setSystemPrompt}
         />
-        <div className="flex-1 flex flex-col">
-          <header className="px-8 py-4 border-b border-paper-200 dark:border-ink-700 flex items-center justify-between bg-paper-100/80 dark:bg-ink-800/60 backdrop-blur supports-[backdrop-filter]:bg-paper-100/60">
-            <H1 className="!text-[2.2rem]">Webtool</H1>
+        <div className="flex-1 flex flex-col min-h-0">
+          <header className="px-4 sm:px-8 py-3 sm:py-4 border-b border-paper-200 dark:border-ink-700 flex items-center justify-between bg-paper-100/80 dark:bg-ink-800/60 backdrop-blur supports-[backdrop-filter]:bg-paper-100/60">
+            <div className="flex items-center gap-3">
+              <button onClick={()=>setSidebarOpen(s=>!s)} className="text-sm px-3 py-1.5 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900 hover:bg-paper-100 dark:hover:bg-ink-800">{sidebarOpen? 'Hide panel':'Show panel'}</button>
+              <H1 className="!text-[2.0rem] sm:!text-[2.2rem]">Webtool</H1>
+            </div>
             <button onClick={()=>setDark(d=>!d)} className="text-sm px-3 py-1.5 rounded bg-ink-900 text-paper-100 hover:bg-ink-800 dark:bg-ink-700 dark:hover:bg-ink-600">{dark? 'Light':'Dark'}</button>
           </header>
           <ChatPanel

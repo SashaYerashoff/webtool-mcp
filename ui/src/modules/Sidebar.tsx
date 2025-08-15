@@ -3,6 +3,7 @@ import { fetchModels } from './services/api';
 import { Button, Card, H2, Select, Textarea } from './ui';
 
 interface SidebarProps {
+  collapsed?: boolean;
   onToggleTheme(): void;
   onNewChat(): void;
   model: string | null;
@@ -11,7 +12,7 @@ interface SidebarProps {
   setSystemPrompt(v: string): void;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ onToggleTheme, onNewChat, model, setModel, systemPrompt, setSystemPrompt }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onToggleTheme, onNewChat, model, setModel, systemPrompt, setSystemPrompt }) => {
   const [models, setModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
   useEffect(()=>{
@@ -26,8 +27,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ onToggleTheme, onNewChat, mode
     })();
   },[]);
   return (
-    <aside className="w-80 border-r border-paper-200 dark:border-ink-700 flex flex-col bg-paper-100/70 dark:bg-ink-800/40">
-      <div className="p-5 space-y-6 overflow-auto">
+    <aside className={(collapsed ? 'w-0 sm:w-12 ' : 'w-80 ') + 'transition-all duration-200 border-r border-paper-200 dark:border-ink-700 flex flex-col bg-paper-100/70 dark:bg-ink-800/40 overflow-hidden'}>
+      <div className={(collapsed ? 'hidden sm:block ' : '') + 'p-5 space-y-6 overflow-auto'}>
         <div>
           <div className="flex items-center justify-between">
             <H2 className="!text-[0.95rem]">Session</H2>
@@ -51,7 +52,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ onToggleTheme, onNewChat, mode
       <Button onClick={onToggleTheme} className="mt-1 w-full text-left !text-[14px]">Toggle Theme</Button>
         </div>
       </div>
-  <div className="mt-auto p-5 text-[12px] text-ink-600 dark:text-paper-400 space-y-1">
+      <div className={(collapsed ? 'hidden sm:block ' : '') + 'mt-auto p-5 text-[12px] text-ink-600 dark:text-paper-400 space-y-1'}>
         <p>webtool-mcp UI</p>
         <p className="text-neutral-600">alpha</p>
       </div>

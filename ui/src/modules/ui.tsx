@@ -46,7 +46,7 @@ export const Card: React.FC<{ className?: string; children: React.ReactNode }>
 
 export const Bubble: React.FC<{ role: 'user' | 'assistant' | 'tool' | 'system' | 'reasoning'; className?: string; children: React.ReactNode }>
   = ({ role, className, children }) => {
-  const base = 'max-w-[80%] rounded-2xl px-5 py-3 text-[16px] whitespace-pre-wrap break-words shadow-sm';
+  const base = 'max-w-[80%] rounded-2xl px-5 py-3 text-[16px] whitespace-pre-wrap break-words [overflow-wrap:anywhere] shadow-sm';
   let scheme = '';
   if (role === 'user') scheme = 'bg-rust-600 text-paper-50';
   else if (role === 'tool' || role === 'reasoning') scheme = 'bg-paper-50 text-ink-900 border border-paper-200 dark:bg-ink-800 dark:text-paper-100 dark:border-ink-700';

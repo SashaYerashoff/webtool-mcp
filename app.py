@@ -272,9 +272,10 @@ def proxy_chat_stream():
         # Append user
         history.append({"role": "user", "content": user})
 
-        # Initial assistant streaming
+        # Multi-pass assistant/tool loop
         assistant_content = ''
         reasoning_content = ''
+        # First assistant pass (initial tokens)
         for kind, token in _lm_studio_stream(history, model):
             if kind == 'assistant':
                 assistant_content += token
@@ -288,46 +289,54 @@ def proxy_chat_stream():
         yield _sse_event('assistant_done', {"phase": "initial"})
         history.append({"role": "assistant", "content": assistant_content})
 
-        # Tool detection and optional execution
-        tool_text = None
         final_assistant = assistant_content
         final_reasoning = reasoning_content
-        tool_json = _extract_tool_json(assistant_content)
-        if tool_json:
+        tool_text = None
+
+        # Iterate tool→assistant cycles up to a safe maximum
+        MAX_TOOL_CALLS = int(os.environ.get('WEBTOOL_MAX_TOOL_CALLS', '4'))
+        calls = 0
+        while calls < MAX_TOOL_CALLS:
+            tool_json = _extract_tool_json(final_assistant)
+            if not tool_json:
+                break
             try:
                 obj = json.loads(tool_json)
                 name = obj.get('name')
                 arguments = obj.get('arguments') or {}
-                if isinstance(name, str):
-                    yield _sse_event('tool_start', {"name": name, "arguments": arguments})
-                    tool_text = _mcp_tool_call(name, arguments if isinstance(arguments, dict) else {})
-                    yield _sse_event('tool', {"name": name, "content": tool_text})
-                    history.append({"role": "tool", "content": tool_text, "name": name})
-                    # Final synthesis streaming
-                    final_assistant = ''
-                    final_reasoning = ''
-                    for kind, token in _lm_studio_stream(history, model):
-                        if kind == 'assistant':
-                            final_assistant += token
-                            yield _sse_event('assistant_final_token', {"text": token})
-                        elif kind == 'reasoning':
-                            final_reasoning += token
-                            yield _sse_event('reasoning_token', {"text": token, "phase": "final"})
-                        elif kind == 'error':
-                            yield _sse_event('error', {"message": token})
-                            return
-                    history.append({"role": "assistant", "content": final_assistant})
+                if not isinstance(name, str):
+                    break
+                calls += 1
+                yield _sse_event('tool_start', {"name": name, "arguments": arguments})
+                tool_text = _mcp_tool_call(name, arguments if isinstance(arguments, dict) else {})
+                yield _sse_event('tool', {"name": name, "content": tool_text})
+                history.append({"role": "tool", "content": tool_text, "name": name})
+                # Next assistant pass (use assistant_final_token to append to same message)
+                final_assistant = ''
+                final_reasoning = ''
+                for kind, token in _lm_studio_stream(history, model):
+                    if kind == 'assistant':
+                        final_assistant += token
+                        yield _sse_event('assistant_final_token', {"text": token})
+                    elif kind == 'reasoning':
+                        final_reasoning += token
+                        yield _sse_event('reasoning_token', {"text": token, "phase": "final"})
+                    elif kind == 'error':
+                        yield _sse_event('error', {"message": token})
+                        return
+                history.append({"role": "assistant", "content": final_assistant})
             except Exception as e:
                 err = f"Tool parse/exec error: {e}"[:500]
                 yield _sse_event('tool', {"error": err})
                 history.append({"role": "tool", "content": err})
+                break
 
-        # Done summary event
+        # Done summary (tool_output omitted to prevent duplication in UI)
         yield _sse_event('done', {
             "session_id": session_id,
             "assistant": final_assistant,
             "assistant_reasoning": final_reasoning,
-            "tool_output": tool_text
+            "tool_output": None
         })
 
     headers = {

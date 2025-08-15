@@ -24,3 +24,42 @@ export function maybeFixUtf8Mojibake(input: string): string {
     return input;
   }
 }
+
+// Remove control tokens like <|start|>, <|channel|>, <|message|>, etc., and leading wrappers like "to=functions.*"
+export function stripControlTokens(input: string): string {
+  if (!input) return input;
+  let out = input.replace(/<\|[^>]+\|>/g, '');
+  out = out.replace(/\bto=functions\.[^\s`]+/g, '');
+  // Tidy multiple spaces/newlines left behind
+  out = out.replace(/[\t \f\v]+/g, ' ');
+  out = out.replace(/\s*\n\s*\n\s*/g, '\n\n').trim();
+  return out;
+}
+
+// Remove a JSON tool call object (optionally inside ``` or ```json fences) from text
+export function removeToolJsonBlock(input: string): string {
+  if (!input) return input;
+  let out = input;
+  // Remove fenced JSON block that looks like a tool call
+  out = out.replace(/```(?:json)?\s*\{[\s\S]*?\}\s*```/g, (m)=>{
+    try {
+      const inner = m.replace(/```(?:json)?/,'').replace(/```/,'').trim();
+      const obj = JSON.parse(inner);
+      if (obj && typeof obj === 'object' && 'name' in obj && 'arguments' in obj) return '';
+    } catch {}
+    return m; // leave non-tool fenced blocks intact
+  });
+  // Remove bare JSON tool object if present
+  out = out.replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, '');
+  // Clean leftover whitespace
+  out = out.replace(/\s*\n\s*\n\s*/g, '\n\n').trim();
+  return out;
+}
+
+export function sanitizeAssistantToken(token: string): string {
+  return stripControlTokens(token);
+}
+
+export function sanitizeAssistantFull(text: string): string {
+  return removeToolJsonBlock(stripControlTokens(text));
+}
