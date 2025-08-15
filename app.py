@@ -18,11 +18,65 @@ from typing import cast  # added
 import os
 import threading
 from collections import deque, OrderedDict
+import uuid
 
 app = Flask(__name__)
 
 # System prompt loader (reads from sysprompt.md)
 _SYSPROMPT_PATH = os.path.join(os.path.dirname(__file__), 'sysprompt.md')
+LM_STUDIO_BASE = os.environ.get("LM_STUDIO_BASE", "http://localhost:1234")
+
+# Simple in-memory session store for integrated proxy (avoids FastAPI when Python 3.13 pydantic build fails)
+_CHAT_SESSIONS: dict[str, list[dict]] = {}
+_TOOL_JSON_RE = re.compile(r'^\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{.*\}\s*\}\s*$', re.DOTALL)
+
+def _extract_tool_json(raw: str) -> str | None:
+    """Extract a JSON tool call object from model text (handles code fences & noise)."""
+    if not raw:
+        return None
+    text = raw.strip()
+    # Remove control tokens like <|...|>
+    text = re.sub(r'<\|[^>]+\|>', '', text).strip()
+    # Code fence first
+    fence = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text)
+    if fence:
+        candidate = fence.group(1).strip()
+        if _TOOL_JSON_RE.match(candidate):
+            return candidate
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and 'name' in obj and 'arguments' in obj:
+                return json.dumps(obj)
+        except Exception:
+            pass
+    # Whole text
+    if _TOOL_JSON_RE.match(text):
+        return text
+    # Heuristic scan for first JSON object containing name & arguments
+    idx = text.find('"name"')
+    while idx != -1:
+        start = text.rfind('{', 0, idx)
+        if start == -1:
+            break
+        depth = 0
+        for j in range(start, len(text)):
+            ch = text[j]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    snippet = text[start:j+1].strip()
+                    if '"arguments"' in snippet:
+                        try:
+                            obj = json.loads(snippet)
+                            if isinstance(obj, dict) and 'name' in obj and 'arguments' in obj:
+                                return json.dumps(obj)
+                        except Exception:
+                            pass
+                    break
+        idx = text.find('"name"', idx + 6)
+    return None
 
 def _load_sysprompt_file() -> str:
     try:
@@ -49,16 +103,298 @@ def get_system_prompt() -> dict:
     prompt = _load_sysprompt_file()
     return {"prompt": prompt, "version": "1.3"}
 
+# -------------------------------------------------------------
+# Integrated light proxy endpoints (optional replacement for backend FastAPI)
+# -------------------------------------------------------------
+def _call_lm_studio(messages: list[dict], model: str | None) -> dict:
+    """Call LM Studio OpenAI-compatible chat endpoint; return dict with content and reasoning (non-stream)."""
+    try:
+        url = LM_STUDIO_BASE.rstrip('/') + '/v1/chat/completions'
+        payload = {"messages": messages, "temperature": 0.2}
+        if model:
+            payload["model"] = model
+        r = requests.post(url, json=payload, timeout=60)
+        if r.status_code >= 400:
+            return {"content": f"LM Studio error {r.status_code}: {r.text[:400]}", "reasoning": ""}
+        data = r.json()
+        msg = (data.get("choices", [{}])[0] or {}).get("message", {}) or {}
+        content = msg.get("content", "") or ""
+        reasoning = msg.get("reasoning_content", "") or ""
+        return {"content": content, "reasoning": reasoning}
+    except Exception as e:
+        return {"content": f"LM Studio request failed: {e}"[:500], "reasoning": ""}
+
+
+def _lm_studio_stream(messages: list[dict], model: str | None):
+    """Yield token deltas from LM Studio streaming API. Yields tuples (kind, text) where kind in {"assistant","reasoning"}."""
+    url = LM_STUDIO_BASE.rstrip('/') + '/v1/chat/completions'
+    payload = {"messages": messages, "temperature": 0.2, "stream": True}
+    if model:
+        payload["model"] = model
+    try:
+        with requests.post(url, json=payload, timeout=60, stream=True) as r:
+            r.raise_for_status()
+            for line in r.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                if line.startswith('data: '):
+                    data = line[len('data: '):].strip()
+                else:
+                    # Some servers omit the prefix
+                    data = line.strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                choice = (obj.get("choices", [{}])[0] or {})
+                delta = choice.get("delta") or choice.get("message") or {}
+                # OpenAI compatible fields
+                if isinstance(delta, dict):
+                    if delta.get("content"):
+                        yield ("assistant", str(delta.get("content")))
+                    # Some models emit reasoning tokens separately
+                    if delta.get("reasoning_content"):
+                        yield ("reasoning", str(delta.get("reasoning_content")))
+    except Exception as e:
+        yield ("error", f"LM Studio stream failed: {e}")
+
+
+def _sse_event(event: str, data: dict | str):
+    """Format a Server-Sent Events block (UTF-8 safe)."""
+    if isinstance(data, str):
+        payload = data
+    else:
+        payload = json.dumps(data, ensure_ascii=False)
+    # SSE requires UTF-8; Flask Response is set with charset. Ensure no stray CRLF
+    return f"event: {event}\ndata: {payload}\n\n"
+
+def _mcp_tool_call(name: str, arguments: dict) -> str:
+    """Invoke a tool via internal JSON-RPC call to this same server (loopback)."""
+    try:
+        rpc = {"jsonrpc":"2.0","id": str(uuid.uuid4()), "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+        # Use requests.post to our own /mcp endpoint
+        r = requests.post(os.environ.get('WEBTOOL_MCP_BASE','http://localhost:5000/mcp'), json=rpc, timeout=60)
+        if r.status_code >= 400:
+            return f"tool call HTTP {r.status_code}: {r.text[:400]}"
+        data = r.json()
+        try:
+            return data["result"]["content"][0]["text"][:120000]
+        except Exception:
+            return json.dumps(data)[:4000]
+    except Exception as e:
+        return f"tool call failed: {e}"[:500]
+
+@app.after_request
+def _cors(resp):
+    resp.headers['Access-Control-Allow-Origin'] = '*'
+    resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    return resp
+
+@app.route('/proxy/models', methods=['GET', 'OPTIONS'])
+def proxy_models():
+    if request.method == 'OPTIONS':
+        return ('',204)
+    # Try LM Studio list
+    try:
+        r = requests.get(LM_STUDIO_BASE.rstrip('/') + '/v1/models', timeout=8)
+        if r.status_code < 400:
+            data = r.json()
+            ids = [m.get('id') for m in data.get('data', []) if m.get('id')]
+            return jsonify({"models": ids})
+    except Exception:
+        pass
+    return jsonify({"models": ["auto"]})
+
+@app.route('/proxy/chat', methods=['POST','OPTIONS'])
+def proxy_chat():
+    if request.method == 'OPTIONS':
+        return ('',204)
+    payload = request.get_json(force=True, silent=True) or {}
+    session_id = payload.get('session_id') or str(uuid.uuid4())
+    user = (payload.get('user') or '').strip()
+    model = payload.get('model') or None
+    system_prompt = payload.get('system_prompt') or None
+    if not user:
+        return jsonify({"error": "user message required"}), 400
+    history = _CHAT_SESSIONS.setdefault(session_id, [])
+    if system_prompt and not any(m for m in history if m.get('role') == 'system'):
+        history.insert(0, {"role": "system", "content": system_prompt})
+    history.append({"role": "user", "content": user})
+    assistant_res = _call_lm_studio(history, model)
+    assistant = assistant_res.get('content','')
+    assistant_reasoning = assistant_res.get('reasoning','')
+    history.append({"role": "assistant", "content": assistant})
+    tool_output = None
+    final_assistant = assistant
+    final_reasoning = assistant_reasoning
+    tool_json = _extract_tool_json(assistant)
+    if tool_json:
+        try:
+            obj = json.loads(tool_json)
+            name = obj.get('name')
+            arguments = obj.get('arguments') or {}
+            if isinstance(name, str):
+                tool_output = _mcp_tool_call(name, arguments if isinstance(arguments, dict) else {})
+                history.append({"role": "tool", "content": tool_output, "name": name})
+                # One follow-up reasoning pass
+                final_res = _call_lm_studio(history, model)
+                final_assistant = final_res.get('content','')
+                final_reasoning = final_res.get('reasoning','')
+                history.append({"role": "assistant", "content": final_assistant})
+        except Exception as e:
+            tool_output = f"Tool parse/exec error: {e}"[:500]
+            history.append({"role": "tool", "content": tool_output})
+    return jsonify({"session_id": session_id, "assistant": final_assistant, "assistant_reasoning": final_reasoning, "tool_output": tool_output})
+
+
+@app.route('/proxy/chat_stream', methods=['GET'])
+def proxy_chat_stream():
+    """SSE streaming chat endpoint.
+    Query params: user, session_id?, model?, system_prompt?
+    Streams events: session, assistant_token, reasoning_token, assistant_done, tool_start, tool, assistant_final_token, done, error
+    """
+    user = (request.args.get('user') or '').strip()
+    if not user:
+        return jsonify({"error": "user message required"}), 400
+    session_id = request.args.get('session_id') or str(uuid.uuid4())
+    model = request.args.get('model') or None
+    system_prompt = request.args.get('system_prompt') or None
+
+    def generate():
+        # CORS-friendly initial event
+        yield _sse_event('session', {"session_id": session_id})
+        history = _CHAT_SESSIONS.setdefault(session_id, [])
+        if system_prompt and not any(m for m in history if m.get('role') == 'system'):
+            history.insert(0, {"role": "system", "content": system_prompt})
+        # Append user
+        history.append({"role": "user", "content": user})
+
+        # Initial assistant streaming
+        assistant_content = ''
+        reasoning_content = ''
+        for kind, token in _lm_studio_stream(history, model):
+            if kind == 'assistant':
+                assistant_content += token
+                yield _sse_event('assistant_token', {"text": token, "phase": "initial"})
+            elif kind == 'reasoning':
+                reasoning_content += token
+                yield _sse_event('reasoning_token', {"text": token, "phase": "initial"})
+            elif kind == 'error':
+                yield _sse_event('error', {"message": token})
+                return
+        yield _sse_event('assistant_done', {"phase": "initial"})
+        history.append({"role": "assistant", "content": assistant_content})
+
+        # Tool detection and optional execution
+        tool_text = None
+        final_assistant = assistant_content
+        final_reasoning = reasoning_content
+        tool_json = _extract_tool_json(assistant_content)
+        if tool_json:
+            try:
+                obj = json.loads(tool_json)
+                name = obj.get('name')
+                arguments = obj.get('arguments') or {}
+                if isinstance(name, str):
+                    yield _sse_event('tool_start', {"name": name, "arguments": arguments})
+                    tool_text = _mcp_tool_call(name, arguments if isinstance(arguments, dict) else {})
+                    yield _sse_event('tool', {"name": name, "content": tool_text})
+                    history.append({"role": "tool", "content": tool_text, "name": name})
+                    # Final synthesis streaming
+                    final_assistant = ''
+                    final_reasoning = ''
+                    for kind, token in _lm_studio_stream(history, model):
+                        if kind == 'assistant':
+                            final_assistant += token
+                            yield _sse_event('assistant_final_token', {"text": token})
+                        elif kind == 'reasoning':
+                            final_reasoning += token
+                            yield _sse_event('reasoning_token', {"text": token, "phase": "final"})
+                        elif kind == 'error':
+                            yield _sse_event('error', {"message": token})
+                            return
+                    history.append({"role": "assistant", "content": final_assistant})
+            except Exception as e:
+                err = f"Tool parse/exec error: {e}"[:500]
+                yield _sse_event('tool', {"error": err})
+                history.append({"role": "tool", "content": err})
+
+        # Done summary event
+        yield _sse_event('done', {
+            "session_id": session_id,
+            "assistant": final_assistant,
+            "assistant_reasoning": final_reasoning,
+            "tool_output": tool_text
+        })
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+        "Content-Type": "text/event-stream; charset=utf-8"
+    }
+    return Response(generate(), headers=headers)
+
+@app.route('/proxy/session/<sid>', methods=['GET'])
+def proxy_session(sid: str):
+    return jsonify({"session_id": sid, "messages": _CHAT_SESSIONS.get(sid, [])})
+
 # ------------------------------------------------------------------
 # Helper functions
 # ------------------------------------------------------------------
 
-def fetch_url(url: str) -> dict:
-    """Return raw HTML of the requested URL."""
+def _decode_html_response(resp: requests.Response) -> str:
+    """Decode HTML bytes to str safely to avoid mojibake (â¦ issues).
+    Order: server-declared (if not latin-1 default) -> apparent_encoding -> utf-8 -> windows-1252 -> latin-1.
+    Additionally attempt latin1->utf8 roundtrip fix when telltale sequences appear.
+    """
+    data = resp.content or b""
+    cand: list[str] = []
+    enc = (resp.encoding or "").lower()
+    if enc and enc not in {"iso-8859-1", "latin-1"}:
+        cand.append(enc)
     try:
-        resp = requests.get(url, timeout=10)
+        app_enc = getattr(resp, "apparent_encoding", None)
+        if app_enc and app_enc.lower() not in {c.lower() for c in cand}:
+            cand.append(app_enc)
+    except Exception:
+        pass
+    for e in ("utf-8", "windows-1252", "latin-1"):
+        if e not in cand:
+            cand.append(e)
+    def _roundtrip_fix(txt: str) -> str:
+        if "â" in txt or "Ã" in txt:
+            try:
+                fixed = txt.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+                # Only keep if it reduces mojibake markers
+                if fixed.count("â") + fixed.count("Ã") < txt.count("â") + txt.count("Ã"):
+                    return fixed
+            except Exception:
+                pass
+        return txt
+    for e in cand:
+        try:
+            text = data.decode(e, errors="strict")
+            return _roundtrip_fix(text)
+        except Exception:
+            continue
+    # Fallback with replacement
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = data.decode("latin-1", errors="replace")
+    return _roundtrip_fix(text)
+
+
+def fetch_url(url: str) -> dict:
+    """Return raw HTML of the requested URL (robust decoding)."""
+    try:
+        resp = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 (compatible; webtool-mcp/1.0)"})
         resp.raise_for_status()
-        return {"content": resp.text}
+        return {"content": _decode_html_response(resp)}
     except requests.RequestException as exc:
         return {"error": f"Could not fetch {url}: {exc}"}
 
@@ -692,7 +1028,10 @@ def format_structured_page(html: str, url: str, chunk_id: str | None = None, mod
         link_lines = []
         for i, l in enumerate(links[:40], 1):
             link_lines.append(f"[L{i}] {l['text']} — {l['url']}")
-        chunk_index_lines = [f"{c['id']} lvl={c['level']} tokens~{c['tokens']} {c['heading'][:120]}" for c in chunks[:60]]
+        chunk_index_lines = [
+            f"{c.get('id')} lvl={c.get('level')} tokens~{c.get('tokens','?')} {str(c.get('heading',''))[:120]}"
+            for c in chunks[:60]
+        ]
         parts = [
             'META', f'source: {url}', f'fetched_at: {_now_iso()}', f'title: {title}', f'description: {meta_desc}' if meta_desc else '', '',
             'OUTLINE', *outline_lines[:80], '', 'LINKS', *(link_lines or ['(none)']), '', 'CHUNKS', *chunk_index_lines, '', 'NEXT', 'Request a section id (e.g. sec-2) or follow a link (e.g. L5).']
@@ -763,7 +1102,7 @@ def format_structured_page(html: str, url: str, chunk_id: str | None = None, mod
     nav_lines = [f"• {n['text']} — {n['url']}" for n in nav_links[:40]]
 
     chunk_index_lines = [
-        f"{c['id']} lvl={c['level']} tokens~{c['tokens']} {c['heading'][:120]}" for c in chunks[:80]
+        f"{c.get('id')} lvl={c.get('level')} tokens~{c.get('tokens','?')} {str(c.get('heading',''))[:120]}" for c in chunks[:80]
     ]
 
     parts = [

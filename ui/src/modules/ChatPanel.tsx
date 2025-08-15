@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { MessageList } from './MessageList';
 import { ToolCallPreview } from './ToolCallPreview';
-import { sendChat } from './services/api';
+import { sendChat, streamChat, type ChatStreamEvent } from './services/api';
+import { maybeFixUtf8Mojibake } from './encoding';
+import { Button, Textarea } from './ui';
 
 interface Props {
   sessionId: string | null;
@@ -16,43 +18,105 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
   const [input, setInput] = useState('');
   const [pendingTool, setPendingTool] = useState<any|null>(null);
   const [sending, setSending] = useState(false);
+  const [streaming, setStreaming] = useState<EventSource|null>(null);
 
   async function send() {
     if(!input.trim() || sending) return;
     const userMsg = input;
     setInput('');
-    setMessages([...messages, {role:'user', content:userMsg}]);
+    const base = [...messages, {role:'user', content:userMsg}];
+    setMessages(base);
     setSending(true);
-    try {
-      const resp = await sendChat({ session_id: sessionId || undefined, user: userMsg, model, system_prompt: systemPrompt });
-      setSessionId(resp.session_id);
-      const newMessages = [...messages, {role:'user', content:userMsg}, {role:'assistant', content: resp.assistant}];
-      if(resp.tool_output){
-        newMessages.push({role:'tool', content: resp.tool_output});
+    // Streamed path
+    let working = [...base];
+    let assistantIdx: number | null = null;
+    let reasoningIdx: number | null = null;
+    let toolIdx: number | null = null;
+    const es = streamChat({ session_id: sessionId || undefined, user: userMsg, model, system_prompt: systemPrompt }, (ev: ChatStreamEvent)=>{
+      if(ev.type === 'session'){
+        if(ev.session_id) setSessionId(ev.session_id);
+        return;
       }
-      setMessages(newMessages);
-    } catch(e:any){
-      setMessages([...messages, {role:'user', content:userMsg}, {role:'assistant', content: `Error: ${e.message}` }]);
-    } finally {
-      setSending(false);
-    }
+      if(ev.type === 'assistant_token'){
+        if(reasoningIdx === null){ /* ensure reasoning shown before assistant only if arrives first */ }
+        const t = maybeFixUtf8Mojibake(ev.text);
+        if(assistantIdx === null){ assistantIdx = working.push({role:'assistant', content: t}) - 1; }
+        else { working[assistantIdx].content += t; }
+        setMessages([...working]);
+        return;
+      }
+      if(ev.type === 'reasoning_token'){
+        if(reasoningIdx === null){ reasoningIdx = working.push({role:'reasoning', content: ev.text}) - 1; }
+        else { working[reasoningIdx].content += ev.text; }
+        setMessages([...working]);
+        return;
+      }
+      if(ev.type === 'assistant_done'){
+        // no-op, next phases may follow
+        return;
+      }
+      if(ev.type === 'tool_start'){
+        setPendingTool(ev);
+        return;
+      }
+      if(ev.type === 'tool'){
+        setPendingTool(null);
+        const content = ev.error ? `Error: ${ev.error}` : (ev.content || '');
+        if(toolIdx === null){ toolIdx = working.push({role:'tool', content}) - 1; }
+        else { working[toolIdx].content = content; }
+        setMessages([...working]);
+        return;
+      }
+      if(ev.type === 'assistant_final_token'){
+        const t = maybeFixUtf8Mojibake(ev.text);
+        if(assistantIdx === null){ assistantIdx = working.push({role:'assistant', content: t}) - 1; }
+        else { working[assistantIdx].content += t; }
+        setMessages([...working]);
+        return;
+      }
+      if(ev.type === 'done'){
+        // Ensure final messages are present
+        if(ev.tool_output && toolIdx === null){ toolIdx = working.push({role:'tool', content: ev.tool_output}) - 1; }
+        if(ev.assistant_reasoning){
+          if(reasoningIdx === null) reasoningIdx = working.push({role:'reasoning', content: ev.assistant_reasoning}) - 1;
+          else working[reasoningIdx].content = ev.assistant_reasoning;
+        }
+        const finalText = maybeFixUtf8Mojibake(ev.assistant);
+        if(assistantIdx === null) assistantIdx = working.push({role:'assistant', content: finalText}) - 1;
+        else working[assistantIdx].content = finalText;
+        setMessages([...working]);
+        setSending(false);
+        setStreaming(null);
+        es.close();
+        return;
+      }
+      if(ev.type === 'error'){
+        working.push({role:'assistant', content: `Error: ${ev.message}`});
+        setMessages([...working]);
+        setSending(false);
+        setStreaming(null);
+        es.close();
+      }
+    });
+    setStreaming(es);
   }
 
   return (
     <div className="flex-1 flex flex-col">
-      <div className="flex-1 overflow-auto">
+  <div className="flex-1 overflow-auto">
         <MessageList messages={messages} />
       </div>
-      <div className="border-t border-neutral-800 p-3 flex flex-col gap-2">
+  <div className="border-t border-paper-200 dark:border-ink-700 p-4 flex flex-col gap-3 bg-paper-100/70 dark:bg-ink-800/40">
         {pendingTool && <ToolCallPreview tool={pendingTool} />}
         <div className="flex gap-2">
-          <textarea
+          <Textarea
             value={input}
             onChange={e=>setInput(e.target.value)}
             placeholder="Ask or instruct..."
-            className="flex-1 resize-none rounded bg-neutral-900 border border-neutral-700 px-3 py-2 text-sm focus:outline-none focus:border-brand-500 h-20"
+            disabled={sending}
+            className="flex-1 h-24"
           />
-          <button disabled={sending} onClick={send} className="px-4 py-2 rounded bg-brand-600 hover:bg-brand-500 disabled:opacity-40 text-sm font-medium">{sending? '...':'Send'}</button>
+      <Button disabled={sending} onClick={send} className="px-5 py-3 !text-[15px]">{sending? 'Streaming…':'Send'}</Button>
         </div>
       </div>
     </div>

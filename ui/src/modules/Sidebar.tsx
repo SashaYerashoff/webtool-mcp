@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { fetchModels } from './services/api';
+import { Button, Card, H2, Select, Textarea } from './ui';
 
 interface SidebarProps {
   onToggleTheme(): void;
@@ -25,32 +26,32 @@ export const Sidebar: React.FC<SidebarProps> = ({ onToggleTheme, onNewChat, mode
     })();
   },[]);
   return (
-    <aside className="w-80 border-r border-neutral-800 flex flex-col">
-      <div className="p-4 space-y-6 overflow-auto">
+    <aside className="w-80 border-r border-paper-200 dark:border-ink-700 flex flex-col bg-paper-100/70 dark:bg-ink-800/40">
+      <div className="p-5 space-y-6 overflow-auto">
         <div>
           <div className="flex items-center justify-between">
-            <h2 className="text-[11px] uppercase font-medium tracking-wider text-neutral-400">Session</h2>
-            <button onClick={onNewChat} className="text-[11px] px-2 py-1 rounded bg-neutral-800 hover:bg-neutral-700">New</button>
+            <H2 className="!text-[0.95rem]">Session</H2>
+            <Button onClick={onNewChat} className="!px-3 !py-1.5 !text-[12px]">New</Button>
           </div>
         </div>
         <div>
-          <h2 className="text-[11px] uppercase font-medium tracking-wider text-neutral-400 mb-2">Model</h2>
-          <select value={model || ''} onChange={e=>setModel(e.target.value)} className="mt-1 w-full bg-neutral-900 border border-neutral-700 rounded px-2 py-1 text-sm focus:outline-none focus:border-brand-500">
+          <H2 className="!text-[0.95rem] mb-2">Model</H2>
+      <Select value={model || ''} onChange={e=>setModel((e.target as HTMLSelectElement).value)}>
             {loadingModels && <option>loading...</option>}
             {!loadingModels && models.length === 0 && <option value="">auto</option>}
             {models.map(m=> <option key={m} value={m}>{m}</option>)}
-          </select>
+          </Select>
         </div>
         <div>
-          <h2 className="text-[11px] uppercase font-medium tracking-wider text-neutral-400 mb-2">System Prompt (first message)</h2>
-          <textarea value={systemPrompt} onChange={e=>setSystemPrompt(e.target.value)} placeholder="Optional system prompt to send once at start" className="w-full h-40 resize-none rounded bg-neutral-900 border border-neutral-700 px-2 py-1 text-xs leading-snug focus:outline-none focus:border-brand-500"></textarea>
+          <H2 className="!text-[0.95rem] mb-2">System Prompt (first message)</H2>
+      <Textarea value={systemPrompt} onChange={e=>setSystemPrompt(e.target.value)} placeholder="Optional system prompt to send once at start" className="h-40 text-[13px]" />
         </div>
         <div>
-          <h2 className="text-[11px] uppercase font-medium tracking-wider text-neutral-400 mb-2">Theme</h2>
-          <button onClick={onToggleTheme} className="mt-1 w-full text-left px-3 py-2 rounded bg-neutral-800 hover:bg-neutral-700 text-sm">Toggle Theme</button>
+          <H2 className="!text-[0.95rem] mb-2">Theme</H2>
+      <Button onClick={onToggleTheme} className="mt-1 w-full text-left !text-[14px]">Toggle Theme</Button>
         </div>
       </div>
-      <div className="mt-auto p-4 text-[11px] text-neutral-500 space-y-1">
+  <div className="mt-auto p-5 text-[12px] text-ink-600 dark:text-paper-400 space-y-1">
         <p>webtool-mcp UI</p>
         <p className="text-neutral-600">alpha</p>
       </div>

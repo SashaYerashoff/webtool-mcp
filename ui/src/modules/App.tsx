@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ChatPanel } from './ChatPanel';
 import { Sidebar } from './Sidebar';
+import { H1 } from './ui';
 
 export default function App() {
   const [dark, setDark] = useState(true);
@@ -15,7 +16,7 @@ export default function App() {
   }
   return (
     <div className={dark ? 'dark' : ''}>
-      <div className="flex h-screen w-full dark:bg-neutral-950 dark:text-neutral-100 bg-white text-neutral-900 transition-colors">
+  <div className="flex h-screen w-full bg-paper-50 text-ink-900 dark:bg-ink-900 dark:text-paper-100 transition-colors">
         <Sidebar
           onToggleTheme={() => setDark(d=>!d)}
           onNewChat={handleNewChat}
@@ -25,9 +26,9 @@ export default function App() {
           setSystemPrompt={setSystemPrompt}
         />
         <div className="flex-1 flex flex-col">
-          <header className="px-4 py-2 border-b border-neutral-800 flex items-center justify-between">
-            <h1 className="text-lg font-semibold tracking-wide">webtool UI</h1>
-            <button onClick={()=>setDark(d=>!d)} className="text-sm px-3 py-1 rounded bg-neutral-800 hover:bg-neutral-700">{dark? 'Light':'Dark'}</button>
+          <header className="px-8 py-4 border-b border-paper-200 dark:border-ink-700 flex items-center justify-between bg-paper-100/80 dark:bg-ink-800/60 backdrop-blur supports-[backdrop-filter]:bg-paper-100/60">
+            <H1 className="!text-[2.2rem]">Webtool</H1>
+            <button onClick={()=>setDark(d=>!d)} className="text-sm px-3 py-1.5 rounded bg-ink-900 text-paper-100 hover:bg-ink-800 dark:bg-ink-700 dark:hover:bg-ink-600">{dark? 'Light':'Dark'}</button>
           </header>
           <ChatPanel
             sessionId={sessionId}
