@@ -19,8 +19,31 @@ import os
 import threading
 from collections import deque, OrderedDict
 import uuid
+from dataclasses import dataclass
+
+# Optional lightweight RAG deps
+try:
+    from pypdf import PdfReader  # type: ignore
+    from rank_bm25 import BM25Okapi  # type: ignore
+    # Optional semantic embeddings (only used if available)
+    try:
+        import numpy as _np  # type: ignore
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception:
+        _np = None  # type: ignore
+        SentenceTransformer = None  # type: ignore
+except Exception:  # graceful fallback if not installed
+    PdfReader = None  # type: ignore
+    BM25Okapi = None  # type: ignore
 
 app = Flask(__name__)
+
+# Early small helper used by search helpers before full parsing helpers are defined later
+def _collapse(text: str) -> str:
+    try:
+        return re.sub(r"\s+", " ", text or "").strip()
+    except Exception:
+        return (text or "").strip()
 
 # System prompt loader (reads from sysprompt.md)
 _SYSPROMPT_PATH = os.path.join(os.path.dirname(__file__), 'sysprompt.md')
@@ -77,6 +100,63 @@ def _extract_tool_json(raw: str) -> str | None:
                     break
         idx = text.find('"name"', idx + 6)
     return None
+
+def _extract_all_tool_jsons(raw: str) -> list[str]:
+    """Extract all tool-call JSON objects (as JSON strings) in document order.
+    Handles fenced blocks first, then scans raw text for balanced JSON objects containing name & arguments.
+    """
+    if not raw:
+        return []
+    text = re.sub(r'<\|[^>]+\|>', '', raw).strip()
+    results: list[str] = []
+    used_spans: list[tuple[int,int]] = []
+    # Fenced blocks
+    for m in re.finditer(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text):
+        candidate = m.group(1).strip()
+        try:
+            obj = json.loads(candidate)
+            if isinstance(obj, dict) and 'name' in obj and 'arguments' in obj:
+                results.append(json.dumps(obj))
+                used_spans.append((m.start(), m.end()))
+        except Exception:
+            continue
+    # Mask fenced spans to avoid double-parsing
+    masked = []
+    last = 0
+    for s,e in sorted(used_spans):
+        masked.append(text[last:s])
+        masked.append(' ' * (e - s))
+        last = e
+    masked.append(text[last:])
+    masked_text = ''.join(masked)
+    # Raw scan similar to _extract_tool_json
+    idx = masked_text.find('"name"')
+    while idx != -1:
+        start = masked_text.rfind('{', 0, idx)
+        if start == -1:
+            break
+        depth = 0
+        end = -1
+        for j in range(start, len(masked_text)):
+            ch = masked_text[j]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    end = j + 1
+                    break
+        if end != -1:
+            snippet = masked_text[start:end].strip()
+            if '"arguments"' in snippet:
+                try:
+                    obj = json.loads(snippet)
+                    if isinstance(obj, dict) and 'name' in obj and 'arguments' in obj:
+                        results.append(json.dumps(obj))
+                except Exception:
+                    pass
+        idx = masked_text.find('"name"', idx + 6)
+    return results
 
 def _load_sysprompt_file() -> str:
     try:
@@ -297,39 +377,49 @@ def proxy_chat_stream():
         MAX_TOOL_CALLS = int(os.environ.get('WEBTOOL_MAX_TOOL_CALLS', '4'))
         calls = 0
         while calls < MAX_TOOL_CALLS:
-            tool_json = _extract_tool_json(final_assistant)
-            if not tool_json:
-                break
-            try:
-                obj = json.loads(tool_json)
+            # Collect all tool calls in the latest assistant text, in order
+            tool_calls = []
+            for tj in _extract_all_tool_jsons(final_assistant):
+                try:
+                    obj = json.loads(tj)
+                except Exception:
+                    continue
                 name = obj.get('name')
                 arguments = obj.get('arguments') or {}
-                if not isinstance(name, str):
+                if isinstance(name, str):
+                    tool_calls.append((name, arguments if isinstance(arguments, dict) else {}))
+            if not tool_calls:
+                break
+            # Execute each tool call (sequential to preserve order; could parallelize with caution)
+            for name, arguments in tool_calls:
+                if calls >= MAX_TOOL_CALLS:
                     break
                 calls += 1
-                yield _sse_event('tool_start', {"name": name, "arguments": arguments})
-                tool_text = _mcp_tool_call(name, arguments if isinstance(arguments, dict) else {})
-                yield _sse_event('tool', {"name": name, "content": tool_text})
-                history.append({"role": "tool", "content": tool_text, "name": name})
-                # Next assistant pass (use assistant_final_token to append to same message)
-                final_assistant = ''
-                final_reasoning = ''
-                for kind, token in _lm_studio_stream(history, model):
-                    if kind == 'assistant':
-                        final_assistant += token
-                        yield _sse_event('assistant_final_token', {"text": token})
-                    elif kind == 'reasoning':
-                        final_reasoning += token
-                        yield _sse_event('reasoning_token', {"text": token, "phase": "final"})
-                    elif kind == 'error':
-                        yield _sse_event('error', {"message": token})
-                        return
-                history.append({"role": "assistant", "content": final_assistant})
-            except Exception as e:
-                err = f"Tool parse/exec error: {e}"[:500]
-                yield _sse_event('tool', {"error": err})
-                history.append({"role": "tool", "content": err})
-                break
+                try:
+                    yield _sse_event('tool_start', {"name": name, "arguments": arguments})
+                    tool_text = _mcp_tool_call(name, arguments)
+                    yield _sse_event('tool', {"name": name, "content": tool_text})
+                    # Append as a tool message so the model can read it next round
+                    history.append({"role": "tool", "content": tool_text, "name": name})
+                except Exception as e:
+                    err = f"Tool exec error: {e}"[:500]
+                    yield _sse_event('tool', {"error": err})
+                    history.append({"role": "tool", "content": err})
+
+            # Ask the model again after appending all tool outputs
+            final_assistant = ''
+            final_reasoning = ''
+            for kind, token in _lm_studio_stream(history, model):
+                if kind == 'assistant':
+                    final_assistant += token
+                    yield _sse_event('assistant_final_token', {"text": token})
+                elif kind == 'reasoning':
+                    final_reasoning += token
+                    yield _sse_event('reasoning_token', {"text": token, "phase": "final"})
+                elif kind == 'error':
+                    yield _sse_event('error', {"message": token})
+                    return
+            history.append({"role": "assistant", "content": final_assistant})
 
         # Done summary (tool_output omitted to prevent duplication in UI)
         yield _sse_event('done', {
@@ -350,6 +440,26 @@ def proxy_chat_stream():
 @app.route('/proxy/session/<sid>', methods=['GET'])
 def proxy_session(sid: str):
     return jsonify({"session_id": sid, "messages": _CHAT_SESSIONS.get(sid, [])})
+
+@app.route('/proxy/tool', methods=['POST', 'OPTIONS'])
+def proxy_tool():
+    """Direct tool invocation for the UI. Body: { name: str, arguments?: dict }
+    Returns: { name, content } where content is tool textual output.
+    """
+    if request.method == 'OPTIONS':
+        return ('', 204)
+    payload = request.get_json(force=True, silent=True) or {}
+    name = (payload.get('name') or '').strip()
+    arguments = payload.get('arguments') or {}
+    if not isinstance(arguments, dict):
+        arguments = {}
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    try:
+        content = _mcp_tool_call(name, arguments)
+        return jsonify({"name": name, "content": content})
+    except Exception as e:
+        return jsonify({"error": f"tool error: {e}"}), 500
 
 # ------------------------------------------------------------------
 # Helper functions
@@ -835,8 +945,304 @@ def _now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _collapse(text: str) -> str:
-    return _WS_RE.sub(" ", text).strip()
+# ------------------------------------------------------------------
+# Luxriot PDF RAG (BM25-based lightweight index)
+# ------------------------------------------------------------------
+
+# You can override file paths via env LUXRIOT_ADMIN_GUIDE / LUXRIOT_MONITOR_GUIDE
+LUXRIOT_DEFAULT_FILES = [
+    os.environ.get("LUXRIOT_ADMIN_GUIDE", os.path.join(os.getcwd(), "Luxriot-EVO-S-Administration-Guide.pdf")),
+    os.environ.get("LUXRIOT_MONITOR_GUIDE", os.path.join(os.getcwd(), "Luxriot-EVO-Monitor-User-Guide.pdf")),
+]
+LUXRIOT_INDEX_PATH = os.environ.get("LUXRIOT_INDEX", os.path.join(os.getcwd(), "luxriot_index.pkl"))
+
+_luxriot_lock = threading.Lock()
+_luxriot_index = None  # type: ignore
+
+
+@dataclass
+class LuxriotChunk:
+    id: str
+    doc: str
+    file: str
+    page_start: int
+    page_end: int
+    text: str
+
+
+class LuxriotIndex:
+    def __init__(self):
+        self.chunks: list[LuxriotChunk] = []
+        self.tokens: list[list[str]] = []
+        self.bm25 = None
+        self.files: list[str] = []
+        self.built_at = None
+        self.embeddings = None  # optional semantic vectors
+        self.embed_model_name = None
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        return re.findall(r"[a-zA-Z0-9]{2,}", (text or "").lower())
+
+    def _chunk_pages(self, reader, file_path: str, doc_name: str):
+        # Accumulate per ~1400 chars with carryover
+        buf = ""
+        start_page = 0
+        chunk_idx = 0
+        for i, page in enumerate(reader.pages):
+            try:
+                txt = page.extract_text() or ""
+            except Exception:
+                txt = ""
+            if not txt.strip():
+                continue
+            if not buf:
+                start_page = i
+            buf += ("\n" if buf else "") + txt
+            if len(buf) >= 1400:
+                chunk_idx += 1
+                cid = f"{doc_name}:{start_page+1}-{i+1}#{chunk_idx}"
+                self.chunks.append(LuxriotChunk(id=cid, doc=doc_name, file=file_path, page_start=start_page+1, page_end=i+1, text=buf.strip()))
+                buf = ""
+        if buf.strip():
+            chunk_idx += 1
+            cid = f"{doc_name}:{start_page+1}-{len(reader.pages)}#{chunk_idx}"
+            self.chunks.append(LuxriotChunk(id=cid, doc=doc_name, file=file_path, page_start=start_page+1, page_end=len(reader.pages), text=buf.strip()))
+
+    def build(self, pdf_paths: list[str]):
+        if PdfReader is None or BM25Okapi is None:
+            raise RuntimeError("Missing dependencies: install pypdf and rank_bm25")
+        self.files = [p for p in pdf_paths if p and os.path.exists(p)]
+        if not self.files:
+            raise FileNotFoundError("No Luxriot PDFs found. Set LUXRIOT_ADMIN_GUIDE and LUXRIOT_MONITOR_GUIDE or place PDFs in project root.")
+        self.chunks.clear()
+        for path in self.files:
+            try:
+                name = os.path.basename(path)
+                if 'Monitor' in name:
+                    doc_name = 'Monitor-User-Guide'
+                elif 'Administration' in name or 'Admin' in name or 'EVO-S' in name:
+                    doc_name = 'EVO-S-Administration-Guide'
+                else:
+                    doc_name = name
+                reader = PdfReader(path)
+                self._chunk_pages(reader, path, doc_name)
+            except Exception as e:
+                app.logger.exception(f"Failed to read {path}: {e}")
+        # Tokens & BM25
+        self.tokens = [self._tokenize(c.text) for c in self.chunks]
+        self.bm25 = BM25Okapi(self.tokens)
+        self.built_at = _now_iso()
+        # Optional embeddings if sentence-transformers available and enabled
+        model_name = os.environ.get("LUXRIOT_EMBED_MODEL")
+        if SentenceTransformer is not None and _np is not None and model_name:
+            try:
+                model = SentenceTransformer(model_name)
+                self.embed_model_name = model_name
+                self.embeddings = model.encode([c.text for c in self.chunks], normalize_embeddings=True)
+            except Exception as e:
+                app.logger.warning(f"Luxriot embeddings build failed: {e}")
+
+    def to_dict(self) -> dict:
+        return {
+            "files": self.files,
+            "built_at": self.built_at,
+            "chunks": [
+                {
+                    "id": c.id,
+                    "doc": c.doc,
+                    "file": c.file,
+                    "page_start": c.page_start,
+                    "page_end": c.page_end,
+                    "text": c.text,
+                }
+                for c in self.chunks
+            ],
+            "tokens": self.tokens,
+            "embed_model": self.embed_model_name,
+            # embeddings are large; cache only if env permits
+            "embeddings": None,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict):
+        idx = cls()
+        idx.files = list(d.get("files", []))
+        idx.built_at = d.get("built_at")
+        idx.chunks = [
+            LuxriotChunk(
+                id=c.get("id",""),
+                doc=c.get("doc",""),
+                file=c.get("file",""),
+                page_start=int(c.get("page_start",0)),
+                page_end=int(c.get("page_end",0)),
+                text=c.get("text",""),
+            )
+            for c in d.get("chunks", [])
+        ]
+        idx.tokens = list(d.get("tokens", []))
+        if BM25Okapi is not None and idx.tokens:
+            try:
+                idx.bm25 = BM25Okapi(idx.tokens)
+            except Exception:
+                idx.bm25 = None
+        idx.embed_model_name = d.get("embed_model")
+        idx.embeddings = None  # do not restore by default; recompute if requested
+        return idx
+
+    def search(self, query: str, k: int = 5, doc: str | None = None) -> list[dict]:
+        if not self.bm25 or not self.chunks:
+            return []
+        qtok = self._tokenize(query)
+        if not qtok:
+            return []
+        scores = self.bm25.get_scores(qtok)
+        idxs = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        out = []
+        for i in idxs:
+            ck = self.chunks[i]
+            if doc and doc.lower() not in ck.doc.lower():
+                continue
+            score = float(scores[i])
+            snippet = ck.text[:500].replace('\n', ' ')
+            out.append({
+                "chunk_id": ck.id,
+                "doc": ck.doc,
+                "pages": f"{ck.page_start}-{ck.page_end}",
+                "score": round(score, 4),
+                "snippet": snippet,
+            })
+            if len(out) >= k:
+                break
+        return out
+
+    def semantic_search(self, query: str, k: int = 5, doc: str | None = None) -> list[dict]:
+        if SentenceTransformer is None or _np is None:
+            return []
+        if not self.chunks:
+            return []
+        # lazily compute embeddings using configured model
+        model_name = os.environ.get("LUXRIOT_EMBED_MODEL")
+        if not model_name:
+            return []
+        try:
+            model = SentenceTransformer(model_name)
+            qv = model.encode([query], normalize_embeddings=True)[0]
+            if self.embeddings is None:
+                self.embeddings = model.encode([c.text for c in self.chunks], normalize_embeddings=True)
+                self.embed_model_name = model_name
+            sims = (self.embeddings @ qv)
+            import numpy as np
+            idxs = np.argsort(-sims)
+            out = []
+            for i in idxs:
+                ck = self.chunks[int(i)]
+                if doc and doc.lower() not in ck.doc.lower():
+                    continue
+                out.append({
+                    "chunk_id": ck.id,
+                    "doc": ck.doc,
+                    "pages": f"{ck.page_start}-{ck.page_end}",
+                    "score": float(sims[int(i)]),
+                    "snippet": ck.text[:500].replace('\n', ' '),
+                })
+                if len(out) >= k:
+                    break
+            return out
+        except Exception as e:
+            app.logger.warning(f"semantic_search failed: {e}")
+            return []
+
+    def get(self, chunk_id: str) -> dict | None:
+        for c in self.chunks:
+            if c.id == chunk_id:
+                return {
+                    "chunk_id": c.id,
+                    "doc": c.doc,
+                    "file": c.file,
+                    "page_start": c.page_start,
+                    "page_end": c.page_end,
+                    "text": c.text,
+                }
+        return None
+
+
+def _luxriot_ensure_index() -> LuxriotIndex | None:  # type: ignore
+    global _luxriot_index
+    with _luxriot_lock:
+        if _luxriot_index is not None:
+            return _luxriot_index
+        try:
+            # Try load from pickle if newer than PDFs
+            import pickle
+            use_cache = False
+            if os.path.exists(LUXRIOT_INDEX_PATH):
+                try:
+                    cache_mtime = os.path.getmtime(LUXRIOT_INDEX_PATH)
+                    pdf_mtimes = [os.path.getmtime(p) for p in LUXRIOT_DEFAULT_FILES if p and os.path.exists(p)]
+                    if pdf_mtimes and cache_mtime >= max(pdf_mtimes):
+                        with open(LUXRIOT_INDEX_PATH, 'rb') as f:
+                            data = pickle.load(f)
+                        idx = LuxriotIndex.from_dict(data)
+                        if idx.chunks and idx.bm25:
+                            _luxriot_index = idx
+                            app.logger.info(f"Luxriot index loaded from cache: {len(idx.chunks)} chunks")
+                            return _luxriot_index
+                except Exception as e:
+                    app.logger.warning(f"Luxriot index cache load failed: {e}")
+
+            # Build fresh
+            idx = LuxriotIndex()
+            idx.build(LUXRIOT_DEFAULT_FILES)
+            # Save to cache
+            try:
+                with open(LUXRIOT_INDEX_PATH, 'wb') as f:
+                    pickle.dump(idx.to_dict(), f)
+                app.logger.info(f"Luxriot index saved to {LUXRIOT_INDEX_PATH}")
+            except Exception as e:
+                app.logger.warning(f"Luxriot index cache save failed: {e}")
+            _luxriot_index = idx
+            app.logger.info(f"Luxriot index built: {len(idx.chunks)} chunks from {len(idx.files)} files")
+            return _luxriot_index
+        except Exception as e:
+            app.logger.warning(f"Luxriot index unavailable: {e}")
+            return None
+
+
+@app.route('/luxriot/status', methods=['GET'])
+def luxriot_status():
+    idx = _luxriot_ensure_index()
+    if not idx:
+        return jsonify({"ready": False})
+    return jsonify({"ready": True, "files": idx.files, "chunks": len(idx.chunks), "built_at": idx.built_at})
+
+
+@app.route('/luxriot/search', methods=['GET'])
+def luxriot_search():
+    q = request.args.get('q') or request.args.get('query')
+    k = int(request.args.get('k') or 5)
+    doc = request.args.get('doc')
+    if not q:
+        return jsonify({"error": "q is required"}), 400
+    idx = _luxriot_ensure_index()
+    if not idx:
+        return jsonify({"ready": False, "items": []})
+    return jsonify({"ready": True, "items": idx.search(q, k=k, doc=doc)})
+
+
+@app.route('/luxriot/get', methods=['GET'])
+def luxriot_get():
+    cid = request.args.get('id') or request.args.get('chunk_id')
+    if not cid:
+        return jsonify({"error": "id is required"}), 400
+    idx = _luxriot_ensure_index()
+    if not idx:
+        return jsonify({"error": "index unavailable"}), 400
+    doc = idx.get(cid)
+    if not doc:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(doc)
+
 
 
 def _token_estimate(text: str) -> int:
@@ -1280,6 +1686,33 @@ def mcp_endpoint():
                     "description": "Return the internal system prompt / guidance for tool usage.",
                     "inputSchema": {"type": "object", "properties": {}},
                 },
+                {
+                    "name": "luxriot_docs_status",
+                    "description": "Status of Luxriot manuals index (ready, files, chunks).",
+                    "inputSchema": {"type": "object", "properties": {}},
+                },
+                {
+                    "name": "luxriot_docs_search",
+                    "description": "Search Luxriot manuals using BM25. Params: query (string), k (number, default 5), doc (optional filter).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "k": {"type": "number"},
+                            "doc": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    },
+                },
+                {
+                    "name": "luxriot_docs_get",
+                    "description": "Get full text of a Luxriot chunk by chunk_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"chunk_id": {"type": "string", "description": "Chunk id returned by luxriot_docs_search"}},
+                        "required": ["chunk_id"]
+                    },
+                },
             ]
             return jsonify(_jsonrpc_result(_id, {"tools": tools}))
 
@@ -1428,7 +1861,14 @@ def mcp_endpoint():
                         if k not in {"engine", "max_results", "engines"} and isinstance(v, str) and v.strip():
                             query = v.strip()
                             break
-                engine = (arguments or {}).get("engine", "duckduckgo")
+                # Auto-prefer Google CSE when configured and engine not explicitly provided
+                engine_arg = None
+                if isinstance(arguments, dict):
+                    engine_arg = arguments.get("engine")
+                if engine_arg is None and os.environ.get("GOOGLE_API_KEY") and os.environ.get("GOOGLE_CSE_ID"):
+                    engine = "google_cse"
+                else:
+                    engine = engine_arg or "duckduckgo"
                 max_results = (arguments or {}).get("max_results", 5)
                 engines = (arguments or {}).get("engines")
                 res = web_search(query, engine=engine, max_results=max_results, engines=engines)
@@ -1460,6 +1900,40 @@ def mcp_endpoint():
             if name == "get_system_prompt":
                 prm = get_system_prompt()
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": prm["prompt"]}]}))
+
+            if name == "luxriot_docs_status":
+                idx = _luxriot_ensure_index()
+                if not idx:
+                    res = {"ready": False, "reason": "index unavailable (missing deps or PDFs)"}
+                else:
+                    res = {"ready": True, "files": idx.files, "chunks": len(idx.chunks), "built_at": idx.built_at}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
+
+            if name == "luxriot_docs_search":
+                q = (arguments or {}).get("query", "")
+                k = int((arguments or {}).get("k", 5))
+                doc = (arguments or {}).get("doc")
+                idx = _luxriot_ensure_index()
+                if not idx:
+                    res = {"ready": False, "items": []}
+                else:
+                    res = {"ready": True, "items": idx.search(q, k=k, doc=doc)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
+
+            if name == "luxriot_docs_get":
+                cid = (arguments or {}).get("chunk_id") or (arguments or {}).get("id")
+                idx = _luxriot_ensure_index()
+                if not cid:
+                    err = {"error": "chunk_id required"}
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(err, ensure_ascii=False)}]}))
+                if not idx:
+                    err = {"error": "index unavailable"}
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(err, ensure_ascii=False)}]}))
+                doc_obj = idx.get(str(cid))
+                if not doc_obj:
+                    err = {"error": "chunk not found"}
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(err, ensure_ascii=False)}]}))
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(doc_obj, ensure_ascii=False)}]}))
 
             return jsonify(_jsonrpc_error(_id, -32601, f"Unknown tool '{name}'"))
 

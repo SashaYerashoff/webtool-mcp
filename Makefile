@@ -12,6 +12,9 @@ install: venv
 	$(ACT) pip install --upgrade pip
 	$(ACT) pip install -r requirements.txt
 
+luxriot-status:
+	$(ACT) python -c "from app import _luxriot_ensure_index; idx=_luxriot_ensure_index(); print('ready:', bool(idx)); print('files:', getattr(idx,'files',None)); print('chunks:', len(getattr(idx,'chunks',[]) or []))"
+
 install-backend: venv
 	$(ACT) pip install --upgrade pip
 	$(ACT) pip install -r backend/requirements.txt

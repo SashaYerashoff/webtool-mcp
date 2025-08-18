@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { ChatPanel } from './ChatPanel';
 import { Sidebar } from './Sidebar';
 import { H1 } from './ui';
+import { getSystemPrompt } from './services/api';
 
 export default function App() {
   const [dark, setDark] = useState(true);
@@ -10,6 +11,15 @@ export default function App() {
   const [model, setModel] = useState<string | null>('');
   const [systemPrompt, setSystemPrompt] = useState<string>('');
   const [messages, setMessages] = useState<any[]>([]);
+  const [streamRef, setStreamRef] = useState<EventSource|null>(null);
+  const [markdown, setMarkdown] = useState<boolean>(false);
+
+  useEffect(()=>{
+    // Prefill system prompt once
+    (async()=>{
+      try{ const p = await getSystemPrompt(); if(p) setSystemPrompt(p); }catch{}
+    })();
+  },[]);
 
   function handleNewChat(){
     setSessionId(null);
@@ -33,7 +43,11 @@ export default function App() {
               <button onClick={()=>setSidebarOpen(s=>!s)} className="text-sm px-3 py-1.5 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900 hover:bg-paper-100 dark:hover:bg-ink-800">{sidebarOpen? 'Hide panel':'Show panel'}</button>
               <H1 className="!text-[2.0rem] sm:!text-[2.2rem]">Webtool</H1>
             </div>
-            <button onClick={()=>setDark(d=>!d)} className="text-sm px-3 py-1.5 rounded bg-ink-900 text-paper-100 hover:bg-ink-800 dark:bg-ink-700 dark:hover:bg-ink-600">{dark? 'Light':'Dark'}</button>
+            <div className="flex items-center gap-2">
+              <button onClick={()=>setDark(d=>!d)} className="text-sm px-3 py-1.5 rounded bg-ink-900 text-paper-100 hover:bg-ink-800 dark:bg-ink-700 dark:hover:bg-ink-600">{dark? 'Light':'Dark'}</button>
+              <button onClick={()=>setMarkdown(m=>!m)} disabled={!!streamRef} className="text-sm px-3 py-1.5 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900 hover:bg-paper-100 dark:hover:bg-ink-800 disabled:opacity-50">{markdown? 'Markdown: On':'Markdown: Off'}</button>
+              {streamRef && <button onClick={()=>{ try{streamRef.close();}catch{}; setStreamRef(null); }} className="text-sm px-3 py-1.5 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900 hover:bg-paper-100 dark:hover:bg-ink-800">Stop</button>}
+            </div>
           </header>
           <ChatPanel
             sessionId={sessionId}
@@ -42,6 +56,8 @@ export default function App() {
             systemPrompt={systemPrompt}
             messages={messages}
             setMessages={setMessages}
+            setStreamingRef={setStreamRef}
+            markdown={markdown}
           />
         </div>
       </div>

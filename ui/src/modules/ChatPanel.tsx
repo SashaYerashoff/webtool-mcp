@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
 import { MessageList } from './MessageList';
 import { ToolCallPreview } from './ToolCallPreview';
-import { sendChat, streamChat, type ChatStreamEvent } from './services/api';
-import { maybeFixUtf8Mojibake } from './encoding';
+import { sendChat, streamChat, type ChatStreamEvent, callTool } from './services/api';
+import { maybeFixUtf8Mojibake, stripToolJsonBlocks } from './encoding';
 import { Button, Textarea } from './ui';
 
 interface Props {
@@ -12,9 +12,11 @@ interface Props {
   systemPrompt?: string;
   messages: any[];
   setMessages(m: any[]): void;
+  setStreamingRef?(es: EventSource|null): void;
+  markdown?: boolean;
 }
 
-export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, systemPrompt, messages, setMessages }) => {
+export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, systemPrompt, messages, setMessages, setStreamingRef, markdown = false }) => {
   const [input, setInput] = useState('');
   const [pendingTool, setPendingTool] = useState<any|null>(null);
   const [sending, setSending] = useState(false);
@@ -43,7 +45,7 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
       }
       if(ev.type === 'assistant_token'){
         if(reasoningIdx === null){ /* ensure reasoning shown before assistant only if arrives first */ }
-        const t = maybeFixUtf8Mojibake(ev.text);
+  const t = stripToolJsonBlocks(maybeFixUtf8Mojibake(ev.text));
         if(assistantIdx === null){ assistantIdx = working.push({role:'assistant', content: t}) - 1; }
         else { working[assistantIdx].content += t; }
         setMessages([...working]);
@@ -73,7 +75,7 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
         return;
       }
       if(ev.type === 'assistant_final_token'){
-        const t = maybeFixUtf8Mojibake(ev.text);
+  const t = stripToolJsonBlocks(maybeFixUtf8Mojibake(ev.text));
         if(assistantIdx === null){ assistantIdx = working.push({role:'assistant', content: t}) - 1; }
         else { working[assistantIdx].content += t; }
         setMessages([...working]);
@@ -86,7 +88,7 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
           if(reasoningIdx === null) reasoningIdx = working.push({role:'reasoning', content: ev.assistant_reasoning}) - 1;
           else working[reasoningIdx].content = ev.assistant_reasoning;
         }
-        const finalText = maybeFixUtf8Mojibake(ev.assistant);
+  const finalText = stripToolJsonBlocks(maybeFixUtf8Mojibake(ev.assistant));
         if(assistantIdx === null) {
           if(finalText && finalText.trim()) {
             assistantIdx = working.push({role:'assistant', content: finalText}) - 1;
@@ -96,6 +98,7 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
         setSending(false);
   setPendingTool(null);
         setStreaming(null);
+  setStreamingRef?.(null);
         es.close();
         return;
       }
@@ -104,19 +107,63 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
         setMessages([...working]);
         setSending(false);
         setStreaming(null);
+  setStreamingRef?.(null);
         es.close();
       }
     });
     setStreaming(es);
+    setStreamingRef?.(es);
+  }
+
+  async function followLink(linkId: string){
+    const baseUrl = extractSourceUrl(messages);
+    if(!baseUrl) return;
+    setPendingTool({ name: 'fetch_url', arguments: { url: baseUrl, link_id: linkId } });
+    try{
+      const res = await callTool('fetch_url', { url: baseUrl, link_id: linkId });
+      const content = res.content || '';
+      setMessages([...messages, { role:'tool', content }]);
+    } finally {
+      setPendingTool(null);
+    }
+  }
+
+  async function fetchSection(secId: string){
+    const baseUrl = extractSourceUrl(messages);
+    if(!baseUrl) return;
+    setPendingTool({ name: 'fetch_url', arguments: { url: baseUrl, chunk_id: secId } });
+    try{
+      const res = await callTool('fetch_url', { url: baseUrl, chunk_id: secId });
+      const content = res.content || '';
+      setMessages([...messages, { role:'tool', content }]);
+    } finally {
+      setPendingTool(null);
+    }
+  }
+
+  function extractSourceUrl(msgs: any[]): string | null {
+    // Try to find the most recent META source: line in a tool output
+    for(let i = msgs.length - 1; i >= 0; i--){
+      const m = msgs[i];
+      if(m.role === 'tool' && typeof m.content === 'string'){
+        const mt = m.content.match(/source:\s*(\S+)/);
+        if(mt) return mt[1];
+      }
+    }
+    return null;
   }
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
   <div ref={scrollRef} className="flex-1 overflow-auto">
-        <MessageList messages={messages} />
+  <MessageList messages={messages} onFollowLink={followLink} onFetchSection={fetchSection} markdown={markdown && !streaming} />
       </div>
   <div className="border-t border-paper-200 dark:border-ink-700 p-4 flex flex-col gap-3 bg-paper-100/70 dark:bg-ink-800/40">
         {pendingTool && <ToolCallPreview tool={pendingTool} />}
+        {/* Show detected base URL if available */}
+        {extractSourceUrl(messages) && (
+          <div className="text-xs text-ink-600 dark:text-paper-400">Base URL: {extractSourceUrl(messages)}</div>
+        )}
         <div className="flex gap-2">
           <Textarea
             value={input}

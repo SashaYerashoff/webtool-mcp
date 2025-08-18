@@ -25,41 +25,82 @@ export function maybeFixUtf8Mojibake(input: string): string {
   }
 }
 
-// Remove control tokens like <|start|>, <|channel|>, <|message|>, etc., and leading wrappers like "to=functions.*"
-export function stripControlTokens(input: string): string {
-  if (!input) return input;
-  let out = input.replace(/<\|[^>]+\|>/g, '');
-  out = out.replace(/\bto=functions\.[^\s`]+/g, '');
-  // Tidy multiple spaces/newlines left behind
-  out = out.replace(/[\t \f\v]+/g, ' ');
-  out = out.replace(/\s*\n\s*\n\s*/g, '\n\n').trim();
-  return out;
-}
-
-// Remove a JSON tool call object (optionally inside ``` or ```json fences) from text
-export function removeToolJsonBlock(input: string): string {
+// Remove tool-call JSON blocks from assistant text to keep the UI clean.
+// Strips:
+// - Fenced blocks like ```json {"name":"...","arguments":{...}} ```
+// - Raw JSON objects containing both "name" and "arguments" (balanced braces only)
+export function stripToolJsonBlocks(input: string): string {
   if (!input) return input;
   let out = input;
-  // Remove fenced JSON block that looks like a tool call
-  out = out.replace(/```(?:json)?\s*\{[\s\S]*?\}\s*```/g, (m)=>{
+  // Remove fenced JSON blocks first
+  out = out.replace(/```(?:json)?\s*\{[\s\S]*?\}\s*```/g, (block)=>{
     try {
-      const inner = m.replace(/```(?:json)?/,'').replace(/```/,'').trim();
-      const obj = JSON.parse(inner);
+      const m = block.match(/\{[\s\S]*\}/);
+      if (!m) return block;
+      const obj = JSON.parse(m[0]);
       if (obj && typeof obj === 'object' && 'name' in obj && 'arguments' in obj) return '';
     } catch {}
-    return m; // leave non-tool fenced blocks intact
+    return block;
   });
-  // Remove bare JSON tool object if present
-  out = out.replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g, '');
-  // Clean leftover whitespace
-  out = out.replace(/\s*\n\s*\n\s*/g, '\n\n').trim();
+  // Remove raw tool JSON objects by scanning for balanced braces around "name"
+  const nameIdx = () => out.indexOf('"name"');
+  let idx = nameIdx();
+  while (idx !== -1) {
+    // find preceding opening brace
+    let start = -1;
+    for (let i = idx; i >= 0; i--) {
+      if (out[i] === '{') { start = i; break; }
+      if (out[i] === '}' || out[i] === '`') break;
+    }
+    if (start === -1) break;
+    // find matching closing brace
+    let depth = 0, end = -1;
+    for (let j = start; j < out.length; j++) {
+      const ch = out[j];
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (end !== -1) {
+      const candidate = out.slice(start, end+1);
+      try {
+        const obj = JSON.parse(candidate);
+        if (obj && typeof obj === 'object' && 'name' in obj && 'arguments' in obj) {
+          out = out.slice(0, start) + out.slice(end+1);
+          idx = nameIdx();
+          continue;
+        }
+      } catch {}
+    }
+    idx = out.indexOf('"name"', idx + 6);
+  }
   return out;
 }
 
-export function sanitizeAssistantToken(token: string): string {
-  return stripControlTokens(token);
-}
-
-export function sanitizeAssistantFull(text: string): string {
-  return removeToolJsonBlock(stripControlTokens(text));
+// Split out model control/preamble tokens (e.g., "<|start|>assistant|channel|...", "<constrain>|json|message>")
+// from the beginning of the string. Returns { preamble, rest } where preamble is the
+// joined lines of control tokens (may be empty) and rest is the remaining content.
+export function splitControlPreamble(input: string): { preamble: string; rest: string } {
+  if (!input) return { preamble: '', rest: '' };
+  const lines = input.split(/\r?\n/);
+  const out: string[] = [];
+  let i = 0;
+  const isControl = (line: string) => {
+    const l = line.trim();
+    if (!l) return false;
+    if (/^<\|[^>]+\|>/.test(l)) return true; // <|...|>
+    if (/<constrain>/i.test(l)) return true;
+    if (/\bassistant\|channel\b/.test(l)) return true;
+    if (/commentary to=functions\./.test(l)) return true;
+    if (/\|json\|message>?$/i.test(l)) return true;
+    // Lines dominated by pipes/angle tokens
+    const pipes = (l.match(/[|<>]/g) || []).length;
+    return pipes >= Math.max(6, Math.floor(l.length * 0.2));
+  };
+  while (i < lines.length && isControl(lines[i])) {
+    out.push(lines[i]);
+    i++;
+  }
+  const preamble = out.join('\n');
+  const rest = lines.slice(i).join('\n').replace(/^\n+/, '');
+  return { preamble, rest };
 }

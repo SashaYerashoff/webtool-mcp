@@ -1,4 +1,21 @@
+.venv/
 __pycache__/
+.pytest_cache/
+.vscode/
+*.pyc
+*.pyo
+*.pyd
+
+# Local data
+luxriot_index.pkl
+*.npy
+*.npz
+*.pdf
+
+# Node
+ui/node_modules/
+ui/.vite/
+ui/dist/__pycache__/
 server.log
 server.pid
 

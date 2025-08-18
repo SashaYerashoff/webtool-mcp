@@ -1,6 +1,6 @@
 // Prefer explicit env override; fallback to same host:5000 Flask integrated proxy
 const DEFAULT_PROXY_BASE = `${location.protocol}//${location.hostname}:5000/proxy`;
-const BASE = (import.meta as any).env?.VITE_BACKEND_BASE || DEFAULT_PROXY_BASE;
+export const BASE = (import.meta as any).env?.VITE_BACKEND_BASE || DEFAULT_PROXY_BASE;
 
 export async function fetchModels(){
   const r = await fetch(`${BASE}/models`);
@@ -25,6 +25,25 @@ export async function getSession(id: string){
   const r = await fetch(`${BASE}/session/${id}`);
   if(!r.ok) throw new Error('session failed');
   return r.json();
+}
+
+export async function callTool(name: string, arguments_: any = {}){
+  const r = await fetch(`${BASE}/tool`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name, arguments: arguments_ }) });
+  if(!r.ok) throw new Error('tool failed');
+  return r.json();
+}
+
+export async function getSystemPrompt(){
+  // Invoke MCP get_system_prompt and return prompt text
+  const payload = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_system_prompt', arguments: {} } };
+  const r = await fetch(`${location.protocol}//${location.hostname}:5000/mcp`, { method: 'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+  if(!r.ok) throw new Error('get_system_prompt failed');
+  const data = await r.json();
+  try{
+    return data.result.content[0].text as string;
+  }catch{
+    return '';
+  }
 }
 
 export type ChatStreamEvent =

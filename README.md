@@ -15,6 +15,9 @@ Tools currently exposed:
 | `search_duckduckgo` | Legacy single DuckDuckGo lookup (prefer `web_search`). |
 | `ai_company_news` | Recent headlines per AI/tech company (OpenAI, Google, Anthropic, Microsoft, Nvidia). |
 | `get_system_prompt` | Returns the internal system prompt with usage guidance. |
+| `luxriot_docs_status` | Status of Luxriot manuals index (ready, files, chunks). |
+| `luxriot_docs_search` | BM25 search across Luxriot manuals (query, k?, doc?). |
+| `luxriot_docs_get` | Get full text of a matched chunk by chunk_id. |
 
 All tools are discoverable through the MCP `tools/list` (or `tools.list`) JSON-RPC method.
 
@@ -233,6 +236,19 @@ curl -s -X POST http://localhost:5000/mcp \
   -H 'Content-Type: application/json' \
   -d '{"name":"latvian_news"}'
 ```
+
+## Luxriot Manuals RAG
+
+Place the two PDFs in the project root (or set absolute env paths):
+
+- Luxriot-EVO-S-Administration-Guide.pdf  (env: LUXRIOT_ADMIN_GUIDE)
+- Luxriot-EVO-Monitor-User-Guide.pdf      (env: LUXRIOT_MONITOR_GUIDE)
+
+On first use, the server builds a lightweight BM25 index in memory. Tools:
+
+- luxriot_docs_status
+- luxriot_docs_search { query, k?=5, doc? }
+- luxriot_docs_get { chunk_id }
 
 ## JSON-RPC Notes
 
