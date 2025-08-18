@@ -1,6 +1,5 @@
 import React from 'react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
+import NewspaperMarkdown from './NewspaperMarkdown';
 import { Bubble, Collapsible } from './ui';
 import { maybeFixUtf8Mojibake, stripToolJsonBlocks, splitControlPreamble } from './encoding';
 
@@ -68,15 +67,9 @@ export const MessageList: React.FC<Props> = ({ messages, onFollowLink, onFetchSe
           ) : null;
           if (markdown) {
             return (
-              <div key={i} className="mx-auto w-full max-w-[900px] text-[16px] leading-7">
+              <div key={i} className="mx-auto w-full max-w-[900px]">
                 {pre}
-                <ReactMarkdown
-                  skipHtml
-                  remarkPlugins={[remarkGfm]}
-                  className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]"
-                >
-                  {content}
-                </ReactMarkdown>
+                <NewspaperMarkdown>{content}</NewspaperMarkdown>
               </div>
             );
           }
