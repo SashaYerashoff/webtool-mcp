@@ -16,6 +16,7 @@ import re
 from urllib.parse import urljoin, urlparse, quote_plus
 from typing import cast  # added
 import os
+import typing
 import threading
 from collections import deque, OrderedDict
 import uuid
@@ -249,6 +250,44 @@ def _sse_event(event: str, data: dict | str):
         payload = json.dumps(data, ensure_ascii=False)
     # SSE requires UTF-8; Flask Response is set with charset. Ensure no stray CRLF
     return f"event: {event}\ndata: {payload}\n\n"
+
+# --- Encoding helpers (mojibake auto-repair) ---
+_MOJIBAKE_RE = re.compile(r"[ÃÂÐÑâœžŸ¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]")
+
+def _maybe_fix_mojibake_py(text: str) -> str:
+    """Best-effort fix for UTF-8 text mis-decoded as Latin-1/Win-1252.
+    If suspicious markers found, try latin-1 reencode → utf-8 decode.
+    Keep the fix only if it reduces markers or introduces Cyrillic.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    # If it already contains non-Latin1 code points (likely fine), skip
+    try:
+        if any(ord(ch) > 255 for ch in text):
+            return text
+    except Exception:
+        return text
+    if not _MOJIBAKE_RE.search(text):
+        return text
+    try:
+        raw = text.encode('latin-1', 'ignore')
+        fixed = raw.decode('utf-8', 'ignore')
+        before = len(_MOJIBAKE_RE.findall(text))
+        after = len(_MOJIBAKE_RE.findall(fixed))
+        if after < before or re.search(r"[\u0400-\u04FF]", fixed):  # Cyrillic appeared
+            return fixed
+    except Exception:
+        pass
+    return text
+
+def _fix_args_mojibake(obj):
+    if isinstance(obj, dict):
+        return {k: _fix_args_mojibake(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_fix_args_mojibake(v) for v in obj]
+    if isinstance(obj, str):
+        return _maybe_fix_mojibake_py(obj)
+    return obj
 
 def _mcp_tool_call(name: str, arguments: dict) -> str:
     """Invoke a tool via internal JSON-RPC call to this same server (loopback)."""
@@ -1728,12 +1767,52 @@ def mcp_endpoint():
                     or params.get("method")
                 )
                 arguments = params.get("arguments") or params.get("args") or {}
+                # Repair mojibake early (russian, etc.) and ensure dict
+                arguments = _fix_args_mojibake(arguments)
+                if not isinstance(arguments, dict):
+                    arguments = {}
+
+            # From here on, always use a narrowed dict view for safety
+            args: dict[str, typing.Any] = arguments if isinstance(arguments, dict) else {}
+            def _arg_str(key: str, default: str = "") -> str:
+                v = args.get(key, default)
+                try:
+                    return str(v) if v is not None else default
+                except Exception:
+                    return default
+            def _arg_opt_str(key: str) -> str | None:
+                v = args.get(key)
+                if v is None:
+                    return None
+                return str(v)
+            def _arg_int(key: str, default: int) -> int:
+                v = args.get(key, default)
+                try:
+                    return int(v)
+                except Exception:
+                    return default
+            def _arg_list_str(key: str) -> list[str] | None:
+                v = args.get(key)
+                if v is None:
+                    return None
+                if isinstance(v, list):
+                    out: list[str] = []
+                    for it in v:
+                        try:
+                            out.append(str(it))
+                        except Exception:
+                            pass
+                    return out
+                # single string
+                if isinstance(v, str):
+                    return [v]
+                return None
 
             if name == "fetch_url":
-                url = (arguments or {}).get("url", "")
-                chunk_id = (arguments or {}).get("chunk_id") or (arguments or {}).get("section")
-                mode = (arguments or {}).get("mode")
-                link_id = (arguments or {}).get("link_id")
+                url = _arg_str("url", "")
+                chunk_id = _arg_opt_str("chunk_id") or _arg_opt_str("section")
+                mode = _arg_opt_str("mode")
+                link_id = _arg_opt_str("link_id")
                 cache_status = []
                 # Use caches
                 html, html_cache_hit, html_error = _cached_fetch_html(url)
@@ -1827,12 +1906,13 @@ def mcp_endpoint():
                         text = insertion + text
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": text}]}))
             if name == "search_wikipedia":
-                query = (arguments or {}).get("query", "")
+                query = _arg_str("query", "")
+                query = _maybe_fix_mojibake_py(query)
                 res = search_wikipedia(query)
                 # Keep JSON-encoded result as text, it's small
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "latvian_news":
-                q = (arguments or {}).get("query")
+                q = _arg_opt_str("query")
                 res = latvian_news(q)
                 items = res.get("items") if isinstance(res, dict) else None
                 if items:
@@ -1850,35 +1930,36 @@ def mcp_endpoint():
                     text = json.dumps(res, ensure_ascii=False)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": text}]}))
             if name == "search_duckduckgo":
-                query = (arguments or {}).get("query", "")
+                query = _arg_str("query", "")
+                query = _maybe_fix_mojibake_py(query)
                 res = search_duckduckgo(query)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "web_search":
                 # Fallback inference: accept 'q' or first stray string value if 'query' missing
-                query = (arguments or {}).get("query") or (arguments or {}).get("q") or ""
-                if not query and isinstance(arguments, dict):
-                    for k, v in arguments.items():
+                query = args.get("query") or args.get("q") or ""
+                if not query and isinstance(args, dict):
+                    for k, v in args.items():
                         if k not in {"engine", "max_results", "engines"} and isinstance(v, str) and v.strip():
                             query = v.strip()
                             break
                 # Auto-prefer Google CSE when configured and engine not explicitly provided
-                engine_arg = None
-                if isinstance(arguments, dict):
-                    engine_arg = arguments.get("engine")
-                if engine_arg is None and os.environ.get("GOOGLE_API_KEY") and os.environ.get("GOOGLE_CSE_ID"):
+                engine_arg = args.get("engine")
+                engine: str
+                if engine_arg in (None, "") and os.environ.get("GOOGLE_API_KEY") and os.environ.get("GOOGLE_CSE_ID"):
                     engine = "google_cse"
                 else:
-                    engine = engine_arg or "duckduckgo"
-                max_results = (arguments or {}).get("max_results", 5)
-                engines = (arguments or {}).get("engines")
+                    engine = str(engine_arg) if engine_arg is not None else "duckduckgo"
+                max_results = _arg_int("max_results", 5)
+                engines = _arg_list_str("engines")
+                query = _maybe_fix_mojibake_py(str(query))
                 res = web_search(query, engine=engine, max_results=max_results, engines=engines)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "site_search":
-                site = (arguments or {}).get("site", "").strip()
-                term = (arguments or {}).get("term", "").strip()
-                engine = (arguments or {}).get("engine", "duckduckgo")
-                max_results = (arguments or {}).get("max_results", 5)
-                engines = (arguments or {}).get("engines")
+                site = _arg_str("site", "").strip()
+                term = _arg_str("term", "").strip()
+                engine = _arg_str("engine", "duckduckgo")
+                max_results = _arg_int("max_results", 5)
+                engines = _arg_list_str("engines")
                 if not site or not term:
                     res = {"error": "site and term required"}
                 else:
@@ -1889,12 +1970,19 @@ def mcp_endpoint():
                     res["original_term"] = term
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "quick_search":
-                query = (arguments or {}).get("query", "")
+                query = _arg_str("query", "")
                 res = quick_search(query)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "ai_company_news":
-                companies = (arguments or {}).get("companies")
-                limit = (arguments or {}).get("limit", 5)
+                companies_any = args.get("companies")
+                companies: list[str] | str | None
+                if companies_any is None:
+                    companies = None
+                elif isinstance(companies_any, list):
+                    companies = [str(c) for c in companies_any]
+                else:
+                    companies = str(companies_any)
+                limit = _arg_int("limit", 5)
                 res = ai_company_news(companies, limit=limit)
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
             if name == "get_system_prompt":
@@ -1910,9 +1998,9 @@ def mcp_endpoint():
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
 
             if name == "luxriot_docs_search":
-                q = (arguments or {}).get("query", "")
-                k = int((arguments or {}).get("k", 5))
-                doc = (arguments or {}).get("doc")
+                q = _arg_str("query", "")
+                k = _arg_int("k", 5)
+                doc = _arg_opt_str("doc")
                 idx = _luxriot_ensure_index()
                 if not idx:
                     res = {"ready": False, "items": []}
@@ -1921,7 +2009,7 @@ def mcp_endpoint():
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
 
             if name == "luxriot_docs_get":
-                cid = (arguments or {}).get("chunk_id") or (arguments or {}).get("id")
+                cid = _arg_opt_str("chunk_id") or _arg_opt_str("id")
                 idx = _luxriot_ensure_index()
                 if not cid:
                     err = {"error": "chunk_id required"}
