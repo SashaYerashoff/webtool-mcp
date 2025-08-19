@@ -524,11 +524,18 @@ def _decode_html_response(resp: requests.Response) -> str:
         if e not in cand:
             cand.append(e)
     def _roundtrip_fix(txt: str) -> str:
+        # If the decoded text already contains Cyrillic, do not attempt latin1->utf8 repair,
+        # as that would drop non-Latin characters.
+        try:
+            if re.search(r"[\u0400-\u04FF]", txt):
+                return txt
+        except Exception:
+            pass
         if "â" in txt or "Ã" in txt:
             try:
                 fixed = txt.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
-                # Only keep if it reduces mojibake markers
-                if fixed.count("â") + fixed.count("Ã") < txt.count("â") + txt.count("Ã"):
+                # Only keep if it reduces mojibake markers and does not drastically shrink text
+                if (fixed.count("â") + fixed.count("Ã")) < (txt.count("â") + txt.count("Ã")) and len(fixed) > len(txt) * 0.5:
                     return fixed
             except Exception:
                 pass
@@ -917,9 +924,22 @@ class _LRUCache:
             self.data[key] = (time.time(), value)
             while len(self.data) > self.capacity:
                 self.data.popitem(last=False)
+    def clear(self):
+        with _html_cache_lock:
+            self.data.clear()
 
 _html_cache = _LRUCache(_HTML_CACHE_MAX)
 _outline_cache = _LRUCache(_HTML_CACHE_MAX)
+
+# Admin helpers
+@app.post('/admin/clear_caches')
+def admin_clear_caches():
+    try:
+        _html_cache.clear()
+        _outline_cache.clear()
+        return jsonify({"cleared": True})
+    except Exception as e:
+        return jsonify({"cleared": False, "error": str(e)}), 500
 
 _rate_lock = threading.Lock()
 _fetch_timestamps = deque()  # timestamps of fetch_url network fetches
@@ -956,14 +976,22 @@ def _cached_fetch_html(url: str) -> tuple[str | None, bool, str | None]:
         _html_cache.put(key, html)
     return html, False, None
 
-def _outline_cache_key(url: str) -> str:
+def _outline_cache_key(url: str, html: str | None = None) -> str:
+    # Include a short checksum of HTML to avoid stale outlines when decoding/extraction changes
+    if html:
+        try:
+            import hashlib
+            h = hashlib.md5(html.encode('utf-8', errors='ignore')).hexdigest()[:8]
+            return f"outline::{url.strip()}::{h}"
+        except Exception:
+            pass
     return f"outline::{url.strip()}"
 
-def _get_cached_outline(url: str) -> str | None:
-    return _outline_cache.get(_outline_cache_key(url), _OUTLINE_CACHE_TTL)
+def _get_cached_outline(url: str, html: str | None = None) -> str | None:
+    return _outline_cache.get(_outline_cache_key(url, html), _OUTLINE_CACHE_TTL)
 
-def _store_cached_outline(url: str, text: str):
-    _outline_cache.put(_outline_cache_key(url), text)
+def _store_cached_outline(url: str, text: str, html: str | None = None):
+    _outline_cache.put(_outline_cache_key(url, html), text)
     app.logger.debug(f"Stored outline cache for {url}")
 
 # ------------------------------------------------------------------
@@ -1822,7 +1850,7 @@ def mcp_endpoint():
                     cache_status.append("html_hit")
                 # Outline cache applies only when outline mode and no chunk/link follow
                 if mode == 'outline' and not chunk_id and not link_id:
-                    cached_outline = _get_cached_outline(url)
+                    cached_outline = _get_cached_outline(url, html)
                     if cached_outline is not None:
                         cache_status.append("outline_hit")
                         text = cached_outline
@@ -1882,7 +1910,7 @@ def mcp_endpoint():
                             text = format_structured_page(html, url, chunk_id=chunk_id, mode=mode)
                             # Always attempt to store if outline mode (no chunk/link)
                             if mode == 'outline' and not chunk_id and not link_id:
-                                _store_cached_outline(url, text)
+                                _store_cached_outline(url, text, html)
                         except Exception as e:
                             app.logger.exception("format_structured_page failed")
                             trunc = html[:1200].replace('\n', ' ')
