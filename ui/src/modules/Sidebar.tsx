@@ -33,6 +33,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   // Vision state
   const [visionReady, setVisionReady] = useState(false);
   const [visionModel, setVisionModel] = useState<string|undefined>(undefined);
+  const [visionHasPillow, setVisionHasPillow] = useState(false);
+  const [visionHasOcr, setVisionHasOcr] = useState(false);
   const [visionUrl, setVisionUrl] = useState('');
   const [visionQ, setVisionQ] = useState('');
   const [visionItems, setVisionItems] = useState<Array<{ id: string; url: string; ocr_text?: string; score?: number }>>([]);
@@ -67,7 +69,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   useEffect(()=>{ refreshPairs(); }, [onlyAnnotated, annoSentiment]);
   useEffect(()=>{
     (async()=>{
-      try{ const st = await getVisionStatus(); setVisionReady(!!st.ready); setVisionModel(st.model||undefined); }catch{ setVisionReady(false);} 
+      try{ const st = await getVisionStatus(); setVisionReady(!!st.ready); setVisionModel(st.model||undefined); setVisionHasPillow(!!st.has_pillow); setVisionHasOcr(!!st.has_ocr); }catch{ setVisionReady(false); setVisionHasPillow(false); setVisionHasOcr(false);} 
     })();
   },[]);
 
@@ -125,16 +127,18 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
           <div className="mb-3 text-[12px] p-2 rounded border border-paper-200 dark:border-ink-700 bg-paper-50/70 dark:bg-ink-900/40">
             <div className="flex items-center justify-between mb-1">
               <span className="font-medium">Vision</span>
-              <span className={`text-[11px] ${visionReady? 'text-green-700 dark:text-green-300':'text-ink-500'}`}>{visionReady? (visionModel? `ready: ${visionModel}`:'ready') : 'unavailable'}</span>
+              <span className={`text-[11px] ${visionReady? 'text-green-700 dark:text-green-300': (visionHasPillow||visionHasOcr)? 'text-amber-700 dark:text-amber-300':'text-ink-500'}`}>
+                {visionReady? (visionModel? `ready: ${visionModel}`:'ready') : (visionHasPillow||visionHasOcr? 'ocr-only' : 'unavailable')}
+              </span>
             </div>
             <div className="flex gap-2 mb-2">
               <input className="flex-1 px-2 py-1 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900" placeholder="Extract images from URL" value={visionUrl} onChange={e=> setVisionUrl((e.target as HTMLInputElement).value)} />
-              <Button className="!px-2 !py-1" disabled={!visionReady || !visionUrl.trim()} onClick={async()=>{
+              <Button className="!px-2 !py-1" disabled={!(visionHasPillow||visionHasOcr) || !visionUrl.trim()} onClick={async()=>{
                 try{ const r = await visionExtractFromUrl(visionUrl.trim(), 6); setVisionItems(r.items.map(it=>({ id: it.id, url: it.url, ocr_text: it.ocr_text })))}catch{}
               }}>Extract</Button>
             </div>
             <div className="flex items-center gap-2 mb-2">
-              <input type="file" accept="image/*" onChange={async (e)=>{
+              <input type="file" accept="image/*" disabled={!(visionHasPillow||visionHasOcr)} onChange={async (e)=>{
                 const f = e.target.files?.[0]; if(!f || !visionReady) return;
                 const buf = await f.arrayBuffer();
                 const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
