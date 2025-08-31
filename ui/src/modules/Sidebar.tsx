@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { fetchModels, listPairs, deletePair, searchPairsHybrid, type PairListItem, listPairsWithAnnotations, listAnnotations, deleteAnnotation, exportAnnotationsDataset, getAnnotationsSummary } from './services/api';
+import { fetchModels, listPairs, deletePair, searchPairsHybrid, type PairListItem, listPairsWithAnnotations, listAnnotations, deleteAnnotation, exportAnnotationsDataset, getAnnotationsSummary, getVisionStatus, visionExtractFromUrl, visionSearch, visionEncode } from './services/api';
 import { Button, Card, H2, Select } from './ui';
 import { PERSONA_LABELS, type PersonaId } from './presets';
 
@@ -30,6 +30,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   const [showTime, setShowTime] = useState(false);
   const [summary, setSummary] = useState<null | { total_annotations: number; total_pairs: number; by_sentiment: any; top_tags: Array<{tag:string;count:number}> }>(null);
   const [exportFmt, setExportFmt] = useState<'jsonl'|'json'|'csv'>('jsonl');
+  // Vision state
+  const [visionReady, setVisionReady] = useState(false);
+  const [visionModel, setVisionModel] = useState<string|undefined>(undefined);
+  const [visionUrl, setVisionUrl] = useState('');
+  const [visionQ, setVisionQ] = useState('');
+  const [visionItems, setVisionItems] = useState<Array<{ id: string; url: string; ocr_text?: string; score?: number }>>([]);
   const debRef = React.useRef<number | undefined>(undefined);
   useEffect(()=>{
     (async()=>{
@@ -59,6 +65,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   }
   useEffect(()=>{ refreshPairs(); },[]);
   useEffect(()=>{ refreshPairs(); }, [onlyAnnotated, annoSentiment]);
+  useEffect(()=>{
+    (async()=>{
+      try{ const st = await getVisionStatus(); setVisionReady(!!st.ready); setVisionModel(st.model||undefined); }catch{ setVisionReady(false);} 
+    })();
+  },[]);
 
   const AGENT_LABEL: Record<string,string> = { researcher: 'Deep Researcher', news: 'News Crawler', support: 'Support Agent', unknown: 'Agent' };
 
@@ -109,6 +120,44 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
           <div className="flex items-center justify-between">
             <H2 className="!text-[0.95rem] mb-2">Library</H2>
             <Button onClick={refreshPairs} className="!px-2 !py-1 !text-[12px]">Refresh</Button>
+          </div>
+          {/* Vision mini panel */}
+          <div className="mb-3 text-[12px] p-2 rounded border border-paper-200 dark:border-ink-700 bg-paper-50/70 dark:bg-ink-900/40">
+            <div className="flex items-center justify-between mb-1">
+              <span className="font-medium">Vision</span>
+              <span className={`text-[11px] ${visionReady? 'text-green-700 dark:text-green-300':'text-ink-500'}`}>{visionReady? (visionModel? `ready: ${visionModel}`:'ready') : 'unavailable'}</span>
+            </div>
+            <div className="flex gap-2 mb-2">
+              <input className="flex-1 px-2 py-1 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900" placeholder="Extract images from URL" value={visionUrl} onChange={e=> setVisionUrl((e.target as HTMLInputElement).value)} />
+              <Button className="!px-2 !py-1" disabled={!visionReady || !visionUrl.trim()} onClick={async()=>{
+                try{ const r = await visionExtractFromUrl(visionUrl.trim(), 6); setVisionItems(r.items.map(it=>({ id: it.id, url: it.url, ocr_text: it.ocr_text })))}catch{}
+              }}>Extract</Button>
+            </div>
+            <div className="flex items-center gap-2 mb-2">
+              <input type="file" accept="image/*" onChange={async (e)=>{
+                const f = e.target.files?.[0]; if(!f || !visionReady) return;
+                const buf = await f.arrayBuffer();
+                const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
+                try{ const r = await visionEncode({ dataBase64: b64 }); setVisionItems(v=>[{ id:r.id, url: r.url||'', ocr_text: r.ocr_text||'' }, ...v].slice(0,8)); }catch{}
+              }} />
+            </div>
+            <div className="flex gap-2">
+              <input className="flex-1 px-2 py-1 rounded border border-paper-200 dark:border-ink-700 bg-paper-50 dark:bg-ink-900" placeholder="Search images (text)" value={visionQ} onChange={e=> setVisionQ((e.target as HTMLInputElement).value)} />
+              <Button className="!px-2 !py-1" disabled={!visionReady || !visionQ.trim()} onClick={async()=>{
+                try{ const r = await visionSearch(visionQ.trim(), 8); setVisionItems(r.items.map(it=>({ id: it.id, url: it.url, ocr_text: it.ocr_text, score: it.score })))}catch{}
+              }}>Search</Button>
+            </div>
+            {visionItems.length>0 && (
+              <div className="mt-2 grid grid-cols-3 gap-2 max-h-40 overflow-auto pr-1">
+                {visionItems.map(it=> (
+                  <div key={it.id} className="text-[11px]">
+                    <img src={it.url} alt="" className="w-full h-16 object-cover rounded border border-paper-200 dark:border-ink-700" />
+                    {it.score!=null && <div className="text-right">{it.score.toFixed(2)}</div>}
+                    {it.ocr_text && <div className="truncate" title={it.ocr_text}>{it.ocr_text}</div>}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2 mb-2 text-[12px]">
             <label className="flex items-center gap-1">

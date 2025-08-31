@@ -249,3 +249,32 @@ export async function getLuxriotStatus(){
   if(!r.ok) throw new Error('luxriot status failed');
   return r.json() as Promise<{ ready: boolean; files?: string[]; chunks?: number; embed_model?: string|null; has_embeddings?: boolean }>;
 }
+
+// Vision API
+export async function getVisionStatus(){
+  const r = await fetch(`${REL_ROOT}/vision/status`);
+  if(!r.ok) throw new Error('vision status failed');
+  return r.json() as Promise<{ ready: boolean; model?: string|null; has_torch?: boolean; has_transformers?: boolean; has_pillow?: boolean; has_ocr?: boolean }>
+}
+
+export async function visionEncode(opts: { url?: string; dataBase64?: string; includeVector?: boolean }){
+  const body: any = {};
+  if(opts.url) body.url = opts.url;
+  if(opts.dataBase64) body.data = opts.dataBase64.replace(/^data:[^;]+;base64,/, '');
+  if(opts.includeVector != null) body.include_vector = opts.includeVector;
+  const r = await fetch(`${REL_ROOT}/vision/encode`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  if(!r.ok) throw new Error('vision encode failed');
+  return r.json() as Promise<{ id: string; url?: string; width?: number; height?: number; mime?: string; ocr_text?: string; embedding?: number[] }>;
+}
+
+export async function visionSearch(q: string, limit: number = 10){
+  const r = await fetch(`${REL_ROOT}/vision/search`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ q, limit }) });
+  if(!r.ok) throw new Error('vision search failed');
+  return r.json() as Promise<{ items: Array<{ id: string; url: string; width?: number; height?: number; mime?: string; ocr_text?: string; tags?: string[]; score?: number }>; query: string }>;
+}
+
+export async function visionExtractFromUrl(url: string, limit: number = 6){
+  const r = await fetch(`${REL_ROOT}/vision/extract_from_url`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url, limit }) });
+  if(!r.ok) throw new Error('vision extract failed');
+  return r.json() as Promise<{ items: Array<{ id: string; url: string; width?: number; height?: number; ocr_text?: string }>; source: string }>; 
+}
