@@ -217,10 +217,30 @@ export async function listPairsWithAnnotations(opts?: { sentiment?: 'positive'|'
   return (data.items || []) as (PairListItem & { annotation_count: number })[];
 }
 
-export function exportAnnotationsDataset(format: 'jsonl'|'json' = 'jsonl'){
-  const url = `${REL_ROOT}/admin/annotations_export?format=${format}`;
+export function exportAnnotationsDataset(format: 'jsonl'|'json'|'csv' = 'jsonl', opts?: { since?: number; until?: number }){
+  const sp = new URLSearchParams();
+  sp.set('format', format);
+  if(opts?.since) sp.set('since', String(opts.since));
+  if(opts?.until) sp.set('until', String(opts.until));
+  const url = `${REL_ROOT}/admin/annotations_export?${sp.toString()}`;
   // open in new tab to trigger download
   window.open(url, '_blank');
+}
+
+export async function getAnnotationsSummary(opts?: { since?: number; until?: number }){
+  const sp = new URLSearchParams();
+  if(opts?.since) sp.set('since', String(opts.since));
+  if(opts?.until) sp.set('until', String(opts.until));
+  const r = await fetch(`${REL_ROOT}/admin/annotations_summary?${sp.toString()}`);
+  if(!r.ok) throw new Error('annotations summary failed');
+  return r.json() as Promise<{
+    total_annotations: number;
+    total_pairs: number;
+    time_range: { since?: number; until?: number };
+    by_sentiment: { positive: number; negative: number; neutral: number };
+    top_tags: Array<{ tag: string; count: number }>;
+    by_agent: Record<string, number>;
+  }>;
 }
 
 // Luxriot status

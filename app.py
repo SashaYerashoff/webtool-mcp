@@ -1596,6 +1596,38 @@ def admin_annotations_export():
         })
     if fmt == 'json':
         return jsonify({"items": items, "count": len(items)})
+    if fmt == 'csv':
+        # CSV export with a stable column set
+        import csv
+        from io import StringIO
+        cols = [
+            "annotation_id","pair_id","annotation_created_at","target","start","end","selected_text",
+            "sentiment","tags","note","rating","pair_created_at","agent_type","user_request","model_response","topic"
+        ]
+        def _row(obj: dict) -> list[str]:
+            out = []
+            for k in cols:
+                v = obj.get(k)
+                if k == 'tags':
+                    try:
+                        v = ",".join([str(t) for t in (v or [])])
+                    except Exception:
+                        v = ''
+                if v is None:
+                    v = ''
+                out.append(str(v))
+            return out
+        sio = StringIO()
+        writer = csv.writer(sio)
+        writer.writerow(cols)
+        for it in items:
+            writer.writerow(_row(it))
+        payload = sio.getvalue()
+        headers = {
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': 'attachment; filename="annotations.csv"'
+        }
+        return Response(payload, headers=headers)
     # default jsonl
     def generate():
         for obj in items:

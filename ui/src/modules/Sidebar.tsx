@@ -29,6 +29,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   const [until, setUntil] = useState<string>('');
   const [showTime, setShowTime] = useState(false);
   const [summary, setSummary] = useState<null | { total_annotations: number; total_pairs: number; by_sentiment: any; top_tags: Array<{tag:string;count:number}> }>(null);
+  const [exportFmt, setExportFmt] = useState<'jsonl'|'json'|'csv'>('jsonl');
   const debRef = React.useRef<number | undefined>(undefined);
   useEffect(()=>{
     (async()=>{
@@ -120,8 +121,13 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
               <option value="negative">negative</option>
             </select>
             <button className="ml-auto underline" onClick={()=> setShowTime(s=>!s)}>{showTime? 'Hide time range':'Time range'}</button>
+            <select value={exportFmt} onChange={e=> setExportFmt((e.target as HTMLSelectElement).value as any)} className="border border-paper-200 dark:border-ink-700 rounded px-1 py-0.5">
+              <option value="jsonl">JSONL</option>
+              <option value="json">JSON</option>
+              <option value="csv">CSV</option>
+            </select>
             <Button className="!px-2 !py-1 !text-[12px]" onClick={()=>{
-              const s = since? Number(since) : undefined; const u = until? Number(until) : undefined; exportAnnotationsDataset('jsonl', { since: s, until: u });
+              const s = since? Number(since) : undefined; const u = until? Number(until) : undefined; exportAnnotationsDataset(exportFmt, { since: s, until: u });
             }}>Export</Button>
           </div>
           {showTime && (
