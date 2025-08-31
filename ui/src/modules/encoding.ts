@@ -8,8 +8,13 @@ export function maybeFixUtf8Mojibake(input: string): string {
     if (input.charCodeAt(i) > 255) return input;
   }
   // Detect common mojibake markers
-  const suspicious = /[ÃÂÐÑâ€ž•™œžŸ¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]/;
+  // Include Latvian-specific artifacts: "Ä", "Å" sequences from mis-decoded UTF-8
+  const suspicious = /[ÃÂÄÅÐÑâ€ž•™œžŸ¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]/;
   if (!suspicious.test(input)) return input;
+  // Only proceed if we see core markers (Ã, â, Â) OR an Ä/Å followed by non-alnum (e.g., Ä«, Å¡)
+  const core = /[ÃâÂÐÑ]/.test(input);
+  const latvianPair = /(Ä|Å)[^A-Za-z0-9\s]/.test(input);
+  if (!core && !latvianPair) return input;
   try {
     // Interpret current 8-bit code units as bytes and decode as UTF-8
     const bytes = new Uint8Array(input.length);
@@ -17,8 +22,9 @@ export function maybeFixUtf8Mojibake(input: string): string {
     const dec = new TextDecoder('utf-8');
     const fixed = dec.decode(bytes);
     // Only keep if it reduced mojibake markers
-    const beforeCount = (input.match(/[ÃÂÐÑâ]/g) || []).length;
-    const afterCount = (fixed.match(/[ÃÂÐÑâ]/g) || []).length;
+  const pat = /[ÃÂâÐÑ]|(?:Ä|Å)[^A-Za-z0-9\s]/g;
+    const beforeCount = (input.match(pat) || []).length;
+    const afterCount = (fixed.match(pat) || []).length;
     return afterCount < beforeCount ? fixed : input;
   } catch {
     return input;
