@@ -1537,20 +1537,36 @@ def admin_clear_caches():
 @app.get('/admin/annotations_export')
 def admin_annotations_export():
     fmt = (request.args.get('format') or 'jsonl').lower()
+    try:
+        since = int(request.args.get('since') or 0)
+    except Exception:
+        since = 0
+    try:
+        until = int(request.args.get('until') or 0)
+    except Exception:
+        until = 0
     # Join annotations with core pair info for fine-tuning datasets
     with _DB_LOCK:
         con = _db_conn()
         try:
             cur = con.cursor()
-            cur.execute(
-                """
-                SELECT a.id, a.pair_id, a.created_at, a.target, a.start, a.end, a.text, a.sentiment, a.tags_json, a.note, a.rating,
-                       p.created_at as pair_created_at, p.agent_type, p.user_request, p.model_response, p.topic
-                FROM pair_annotations a
-                JOIN pairs p ON p.id = a.pair_id
-                ORDER BY a.created_at DESC
-                """
+            sql = (
+                "SELECT a.id, a.pair_id, a.created_at, a.target, a.start, a.end, a.text, a.sentiment, a.tags_json, a.note, a.rating, "
+                "p.created_at as pair_created_at, p.agent_type, p.user_request, p.model_response, p.topic "
+                "FROM pair_annotations a JOIN pairs p ON p.id = a.pair_id"
             )
+            where = []
+            params: list[typing.Any] = []
+            if since > 0:
+                where.append("a.created_at >= ?")
+                params.append(since)
+            if until > 0:
+                where.append("a.created_at <= ?")
+                params.append(until)
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY a.created_at DESC"
+            cur.execute(sql, tuple(params))
             rows = cur.fetchall()
         finally:
             con.close()
@@ -1589,6 +1605,80 @@ def admin_annotations_export():
         'Content-Disposition': 'attachment; filename="annotations.jsonl"'
     }
     return Response(generate(), headers=headers)
+
+@app.get('/admin/annotations_summary')
+def admin_annotations_summary():
+    try:
+        since = int(request.args.get('since') or 0)
+    except Exception:
+        since = 0
+    try:
+        until = int(request.args.get('until') or 0)
+    except Exception:
+        until = 0
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            # Base filter
+            where = []
+            params: list[typing.Any] = []
+            if since > 0:
+                where.append("a.created_at >= ?")
+                params.append(since)
+            if until > 0:
+                where.append("a.created_at <= ?")
+                params.append(until)
+            wsql = (" WHERE " + " AND ".join(where)) if where else ""
+            # Totals
+            cur.execute(f"SELECT COUNT(*), MIN(a.created_at), MAX(a.created_at) FROM pair_annotations a{wsql}", tuple(params))
+            row = cur.fetchone() or (0, None, None)
+            total = row[0] or 0
+            min_ts = row[1]
+            max_ts = row[2]
+            # Distinct pairs
+            cur.execute(f"SELECT COUNT(DISTINCT a.pair_id) FROM pair_annotations a{wsql}", tuple(params))
+            total_pairs = (cur.fetchone() or (0,))[0] or 0
+            # Sentiment counts
+            cur.execute(f"SELECT COALESCE(a.sentiment,''), COUNT(*) FROM pair_annotations a{wsql} GROUP BY COALESCE(a.sentiment,'')", tuple(params))
+            by_sent = { (r[0] or ''): r[1] for r in cur.fetchall() }
+            # Tags
+            cur.execute(f"SELECT a.tags_json FROM pair_annotations a{wsql}", tuple(params))
+            tag_counts: dict[str,int] = {}
+            for (tags_json,) in cur.fetchall():
+                try:
+                    tags = json.loads(tags_json or '[]')
+                    if isinstance(tags, list):
+                        for t in tags:
+                            try:
+                                k = str(t).strip()
+                                if not k: continue
+                                tag_counts[k] = tag_counts.get(k,0) + 1
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+            top_tags = sorted(([{"tag": k, "count": v} for k, v in tag_counts.items()]), key=lambda x: x["count"], reverse=True)[:20]
+            # By agent
+            cur.execute(
+                f"SELECT p.agent_type, COUNT(*) FROM pair_annotations a JOIN pairs p ON p.id=a.pair_id{wsql} GROUP BY p.agent_type",
+                tuple(params)
+            )
+            by_agent = { (r[0] or 'unknown'): r[1] for r in cur.fetchall() }
+        finally:
+            con.close()
+    return jsonify({
+        "total_annotations": total,
+        "total_pairs": total_pairs,
+        "time_range": {"since": since or min_ts, "until": until or max_ts},
+        "by_sentiment": {
+            "positive": by_sent.get('positive', 0),
+            "negative": by_sent.get('negative', 0),
+            "neutral": by_sent.get('', 0)
+        },
+        "top_tags": top_tags,
+        "by_agent": by_agent
+    })
 
 _rate_lock = threading.Lock()
 _fetch_timestamps = deque()  # timestamps of fetch_url network fetches

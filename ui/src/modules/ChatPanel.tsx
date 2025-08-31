@@ -29,6 +29,7 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
   const [pendingAnno, setPendingAnno] = useState<{ text: string; start: number; end: number }|null>(null);
   const [annoSentiment, setAnnoSentiment] = useState<'positive'|'negative'|''>('');
   const [annoTags, setAnnoTags] = useState<string>('');
+  const quickTags = ['precise','creative','lie','boring','stop hallucinate'];
   const [annoNote, setAnnoNote] = useState<string>('');
   const [annoRating, setAnnoRating] = useState<string>('');
 
@@ -245,6 +246,15 @@ export const ChatPanel: React.FC<Props> = ({ sessionId, setSessionId, model, sys
               <label className="flex items-center gap-1">Rating:
                 <input type="number" min={1} max={5} value={annoRating} onChange={e=>setAnnoRating((e.target as HTMLInputElement).value)} className="w-16 border border-paper-200 dark:border-ink-700 rounded px-2 py-0.5" />
               </label>
+            </div>
+            <div className="flex flex-wrap gap-2 mb-2">
+              {quickTags.map(t=> (
+                <button key={t} className="text-[11px] px-2 py-0.5 rounded border border-paper-200 dark:border-ink-700 hover:bg-paper-100 dark:hover:bg-ink-800" onClick={()=>{
+                  const tags = new Set(annoTags.split(',').map(s=>s.trim()).filter(Boolean));
+                  tags.add(t);
+                  setAnnoTags(Array.from(tags).join(', '));
+                }}>{t}</button>
+              ))}
             </div>
             <textarea value={annoNote} onChange={e=>setAnnoNote((e.target as HTMLTextAreaElement).value)} placeholder="Add a brief note (issue/solution context)" className="w-full h-16 border border-paper-200 dark:border-ink-700 rounded px-2 py-1 text-[12px] bg-paper-50 dark:bg-ink-900" />
             <div className="mt-2 flex gap-2">

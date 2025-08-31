@@ -25,6 +25,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   const [annoSentiment, setAnnoSentiment] = useState<''|'positive'|'negative'>('');
   const [openPairAnno, setOpenPairAnno] = useState<string|null>(null);
   const [openPairAnnoItems, setOpenPairAnnoItems] = useState<Record<string, any[]>>({});
+  const [since, setSince] = useState<string>('');
+  const [until, setUntil] = useState<string>('');
   const debRef = React.useRef<number | undefined>(undefined);
   useEffect(()=>{
     (async()=>{
@@ -114,7 +116,11 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
               <option value="positive">positive</option>
               <option value="negative">negative</option>
             </select>
-            <Button className="!px-2 !py-1 !text-[12px] ml-auto" onClick={()=> exportAnnotationsDataset('jsonl')}>Export dataset</Button>
+            <div className="ml-auto flex items-center gap-1">
+              <input type="number" placeholder="since ts" value={since} onChange={e=>setSince((e.target as HTMLInputElement).value)} className="w-24 px-1 py-0.5 border border-paper-200 dark:border-ink-700 rounded" />
+              <input type="number" placeholder="until ts" value={until} onChange={e=>setUntil((e.target as HTMLInputElement).value)} className="w-24 px-1 py-0.5 border border-paper-200 dark:border-ink-700 rounded" />
+              <Button className="!px-2 !py-1 !text-[12px]" onClick={()=> exportAnnotationsDataset('jsonl')}>Export</Button>
+            </div>
           </div>
           <div className="mb-2">
             <input
