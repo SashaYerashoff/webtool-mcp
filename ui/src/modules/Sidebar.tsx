@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { fetchModels, listPairs, deletePair, searchPairsHybrid, type PairListItem, listPairsWithAnnotations, listAnnotations, deleteAnnotation, exportAnnotationsDataset } from './services/api';
+import { fetchModels, listPairs, deletePair, searchPairsHybrid, type PairListItem, listPairsWithAnnotations, listAnnotations, deleteAnnotation, exportAnnotationsDataset, getAnnotationsSummary } from './services/api';
 import { Button, Card, H2, Select } from './ui';
 import { PERSONA_LABELS, type PersonaId } from './presets';
 
@@ -27,6 +27,8 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
   const [openPairAnnoItems, setOpenPairAnnoItems] = useState<Record<string, any[]>>({});
   const [since, setSince] = useState<string>('');
   const [until, setUntil] = useState<string>('');
+  const [showTime, setShowTime] = useState(false);
+  const [summary, setSummary] = useState<null | { total_annotations: number; total_pairs: number; by_sentiment: any; top_tags: Array<{tag:string;count:number}> }>(null);
   const debRef = React.useRef<number | undefined>(undefined);
   useEffect(()=>{
     (async()=>{
@@ -55,6 +57,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
     }
   }
   useEffect(()=>{ refreshPairs(); },[]);
+  useEffect(()=>{ refreshPairs(); }, [onlyAnnotated, annoSentiment]);
 
   const AGENT_LABEL: Record<string,string> = { researcher: 'Deep Researcher', news: 'News Crawler', support: 'Support Agent', unknown: 'Agent' };
 
@@ -106,7 +109,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
             <H2 className="!text-[0.95rem] mb-2">Library</H2>
             <Button onClick={refreshPairs} className="!px-2 !py-1 !text-[12px]">Refresh</Button>
           </div>
-          <div className="flex items-center gap-2 mb-2 text-[12px]">
+          <div className="flex flex-wrap items-center gap-2 mb-2 text-[12px]">
             <label className="flex items-center gap-1">
               <input type="checkbox" checked={onlyAnnotated} onChange={e=>{ setOnlyAnnotated(e.target.checked); }} />
               Only annotated
@@ -116,12 +119,26 @@ export const Sidebar: React.FC<SidebarProps> = ({ collapsed = false, onNewChat, 
               <option value="positive">positive</option>
               <option value="negative">negative</option>
             </select>
-            <div className="ml-auto flex items-center gap-1">
-              <input type="number" placeholder="since ts" value={since} onChange={e=>setSince((e.target as HTMLInputElement).value)} className="w-24 px-1 py-0.5 border border-paper-200 dark:border-ink-700 rounded" />
-              <input type="number" placeholder="until ts" value={until} onChange={e=>setUntil((e.target as HTMLInputElement).value)} className="w-24 px-1 py-0.5 border border-paper-200 dark:border-ink-700 rounded" />
-              <Button className="!px-2 !py-1 !text-[12px]" onClick={()=> exportAnnotationsDataset('jsonl')}>Export</Button>
-            </div>
+            <button className="ml-auto underline" onClick={()=> setShowTime(s=>!s)}>{showTime? 'Hide time range':'Time range'}</button>
+            <Button className="!px-2 !py-1 !text-[12px]" onClick={()=>{
+              const s = since? Number(since) : undefined; const u = until? Number(until) : undefined; exportAnnotationsDataset('jsonl', { since: s, until: u });
+            }}>Export</Button>
           </div>
+          {showTime && (
+            <div className="mb-2 grid grid-cols-2 gap-2 text-[12px]">
+              <input type="number" placeholder="since (epoch s)" value={since} onChange={e=>setSince((e.target as HTMLInputElement).value)} className="w-full px-2 py-1 border border-paper-200 dark:border-ink-700 rounded" />
+              <input type="number" placeholder="until (epoch s)" value={until} onChange={e=>setUntil((e.target as HTMLInputElement).value)} className="w-full px-2 py-1 border border-paper-200 dark:border-ink-700 rounded" />
+              <Button className="!px-2 !py-1 !text-[12px]" onClick={async()=>{
+                try{ const s = since? Number(since): undefined; const u = until? Number(until): undefined; const sum = await getAnnotationsSummary({ since: s, until: u }); setSummary({ total_annotations: sum.total_annotations, total_pairs: sum.total_pairs, by_sentiment: sum.by_sentiment, top_tags: sum.top_tags }); }catch{}
+              }}>Preview</Button>
+              {summary && (
+                <div className="text-[11px] text-ink-700 dark:text-paper-300 col-span-2">
+                  <div>Total: {summary.total_annotations} notes • Pairs: {summary.total_pairs} • Sentiment: +{summary.by_sentiment?.positive||0}/-{summary.by_sentiment?.negative||0}/~{summary.by_sentiment?.neutral||0}</div>
+                  {summary.top_tags?.length>0 && <div className="truncate">Top tags: {summary.top_tags.slice(0,6).map(t=>`${t.tag}(${t.count})`).join(', ')}</div>}
+                </div>
+              )}
+            </div>
+          )}
           <div className="mb-2">
             <input
               value={q}
