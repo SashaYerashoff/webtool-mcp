@@ -22,6 +22,8 @@ from collections import deque, OrderedDict
 import uuid
 from dataclasses import dataclass
 import sqlite3
+import base64
+import io
 
 # Optional lightweight RAG deps
 try:
@@ -44,6 +46,23 @@ except Exception:  # graceful fallback if not installed
     BM25Okapi = None  # type: ignore
 
 app = Flask(__name__)
+
+# Optional vision deps (SigLIP via transformers, Pillow for image IO, pytesseract for OCR)
+try:
+    from PIL import Image  # type: ignore
+except Exception:
+    Image = None  # type: ignore
+try:
+    import torch  # type: ignore
+    from transformers import AutoProcessor, AutoModel  # type: ignore
+except Exception:
+    torch = None  # type: ignore
+    AutoProcessor = None  # type: ignore
+    AutoModel = None  # type: ignore
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None  # type: ignore
 
 # Early small helper used by search helpers before full parsing helpers are defined later
 def _collapse(text: str) -> str:
@@ -221,6 +240,30 @@ def _db_init():
                 )
                 """
             )
+            # Vision: indexed images with optional OCR/tags
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vision_items (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER,
+                    src_url TEXT,
+                    mime TEXT,
+                    width INTEGER,
+                    height INTEGER,
+                    ocr_text TEXT,
+                    tags_json TEXT,
+                    meta_json TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vision_emb (
+                    id TEXT PRIMARY KEY,
+                    vec TEXT
+                )
+                """
+            )
             con.commit()
         finally:
             con.close()
@@ -291,6 +334,111 @@ def _get_embedding_model():
     except Exception as e:
         app.logger.warning(f"Embedding model load failed: {e}")
         _EMB_MODEL = None
+        return None
+
+# ---- SigLIP vision model (optional) ----
+_VISION_MODEL = None
+_VISION_PROCESSOR = None
+_VISION_MODEL_NAME = None
+def _get_vision_model():
+    global _VISION_MODEL, _VISION_PROCESSOR, _VISION_MODEL_NAME
+    if _VISION_MODEL is not None and _VISION_PROCESSOR is not None:
+        return _VISION_MODEL, _VISION_PROCESSOR
+    model_name = os.getenv("WEBTOOL_VISION_MODEL", "google/siglip-so400m-patch14-384")
+    if AutoModel is None or AutoProcessor is None or torch is None:
+        return None
+    try:
+        _VISION_PROCESSOR = AutoProcessor.from_pretrained(model_name)
+        _VISION_MODEL = AutoModel.from_pretrained(model_name)
+        _VISION_MODEL_NAME = model_name
+        try:
+            _VISION_MODEL.eval()
+        except Exception:
+            pass
+        return _VISION_MODEL, _VISION_PROCESSOR
+    except Exception as e:
+        app.logger.warning(f"Vision model load failed: {e}")
+        _VISION_MODEL = None
+        _VISION_PROCESSOR = None
+        return None
+
+def _siglip_image_embed(pil_img) -> list[float] | None:
+    mp = _get_vision_model()
+    if not mp:
+        return None
+    model, processor = mp
+    try:
+        import numpy as np  # local optional
+        inputs = processor(images=pil_img, return_tensors="pt")
+        if torch is not None and hasattr(torch, 'no_grad'):
+            with torch.no_grad():
+                feats = model.get_image_features(**inputs)
+        else:
+            feats = model.get_image_features(**inputs)
+        # L2 normalize
+        v = feats[0].detach().cpu().numpy()
+        n = float(np.linalg.norm(v)) or 1.0
+        v = (v / n).astype(float)
+        return v.tolist()
+    except Exception as e:
+        app.logger.warning(f"image embed failed: {e}")
+        return None
+
+def _siglip_text_embed(text: str) -> list[float] | None:
+    mp = _get_vision_model()
+    if not mp:
+        return None
+    model, processor = mp
+    try:
+        import numpy as np
+        inputs = processor(text=[text], padding=True, return_tensors="pt")
+        if torch is not None and hasattr(torch, 'no_grad'):
+            with torch.no_grad():
+                feats = model.get_text_features(**inputs)
+        else:
+            feats = model.get_text_features(**inputs)
+        v = feats[0].detach().cpu().numpy()
+        n = float(np.linalg.norm(v)) or 1.0
+        v = (v / n).astype(float)
+        return v.tolist()
+    except Exception as e:
+        app.logger.warning(f"text embed failed: {e}")
+        return None
+
+def _vision_save_item(src_url: str | None, mime: str | None, w: int | None, h: int | None, ocr_text: str | None, tags: list[str] | None, meta: dict | None, vec: list[float] | None):
+    vid = str(uuid.uuid4())
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "INSERT INTO vision_items (id, created_at, src_url, mime, width, height, ocr_text, tags_json, meta_json) VALUES (?,?,?,?,?,?,?,?,?)",
+                (vid, _now_ts(), src_url or '', mime or '', w or 0, h or 0, ocr_text or '', json.dumps(tags or [], ensure_ascii=False), json.dumps(meta or {}, ensure_ascii=False))
+            )
+            if vec is not None:
+                try:
+                    cur.execute("REPLACE INTO vision_emb (id, vec) VALUES (?,?)", (vid, json.dumps(vec)))
+                except Exception:
+                    pass
+            con.commit()
+        finally:
+            con.close()
+    return vid
+
+def _open_image_from_bytes(data: bytes):
+    if Image is None:
+        return None
+    try:
+        return Image.open(io.BytesIO(data)).convert('RGB')
+    except Exception:
+        return None
+
+def _ocr_image(pil_img) -> str | None:
+    if pytesseract is None or pil_img is None:
+        return None
+    try:
+        return pytesseract.image_to_string(pil_img)
+    except Exception:
         return None
 
 def save_pair(session_id: str, agent_type: str, user_request: str, model_response: str, thinking: str | None, tool_use_log: list[dict] | None, parent_pair_id: str | None, topic: str | None):
@@ -1638,6 +1786,147 @@ def admin_annotations_export():
     }
     return Response(generate(), headers=headers)
 
+@app.get('/vision/status')
+def vision_status():
+    ready = _get_vision_model() is not None
+    return jsonify({
+        "ready": bool(ready),
+        "model": _VISION_MODEL_NAME,
+        "has_torch": bool(torch is not None),
+        "has_transformers": bool(AutoModel is not None),
+        "has_pillow": bool(Image is not None),
+        "has_ocr": bool(pytesseract is not None)
+    })
+
+@app.post('/vision/encode')
+def vision_encode():
+    body = request.get_json(silent=True) or {}
+    url = (body.get('url') or '').strip()
+    b64 = (body.get('data') or '').strip()
+    include_vec = str(body.get('include_vector') or '').strip().lower() in {'1','true','yes'}
+    if not url and not b64:
+        return jsonify({"error": "url or data required"}), 400
+    data: bytes | None = None
+    mime = None
+    try:
+        if url:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.content
+            mime = r.headers.get('Content-Type')
+        else:
+            data = base64.b64decode(b64)
+    except Exception as e:
+        return jsonify({"error": f"image fetch/decode failed: {e}"}), 400
+    pil = _open_image_from_bytes(data or b'')
+    w = pil.width if pil is not None else None
+    h = pil.height if pil is not None else None
+    vec = _siglip_image_embed(pil) if pil is not None else None
+    ocr_txt = _ocr_image(pil)
+    vid = _vision_save_item(url or None, mime, w, h, ocr_txt, None, None, vec)
+    resp = {"id": vid, "url": url or None, "width": w, "height": h, "mime": mime, "ocr_text": ocr_txt or ''}
+    if include_vec and vec is not None:
+        resp["embedding"] = vec
+    return jsonify(resp)
+
+@app.post('/vision/search')
+def vision_search():
+    body = request.get_json(silent=True) or {}
+    q = (body.get('q') or body.get('query') or '').strip()
+    try:
+        limit = int(body.get('limit') or 10)
+    except Exception:
+        limit = 10
+    if not q:
+        return jsonify({"error": "q required"}), 400
+    qv = _siglip_text_embed(q)
+    if qv is None:
+        return jsonify({"error": "vision model unavailable"}), 400
+    # Load all vision vectors (small scale); in production, use ANN index
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT id, vec FROM vision_emb")
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    items: list[tuple[float,str]] = []
+    for pid, vec_json in rows:
+        try:
+            v = json.loads(vec_json)
+            sc = _cosine(qv, v)  # reuse cosine
+            items.append((float(sc), pid))
+        except Exception:
+            continue
+    items.sort(key=lambda t: t[0], reverse=True)
+    top = items[:limit]
+    results = []
+    if top:
+        with _DB_LOCK:
+            con = _db_conn()
+            try:
+                cur = con.cursor()
+                qmarks = ','.join(['?']*len(top))
+                cur.execute(f"SELECT id, created_at, src_url, mime, width, height, ocr_text, tags_json, meta_json FROM vision_items WHERE id IN ({qmarks})", tuple([pid for _, pid in top]))
+                rows2 = cur.fetchall()
+            finally:
+                con.close()
+        info = {r[0]: r for r in rows2}
+        for sc, pid in top:
+            r = info.get(pid)
+            if not r:
+                continue
+            try:
+                tags = json.loads(r[7] or '[]')
+            except Exception:
+                tags = []
+            results.append({
+                "id": r[0], "created_at": r[1], "url": r[2], "mime": r[3], "width": r[4], "height": r[5],
+                "ocr_text": r[6] or '', "tags": tags, "score": round(float(sc),4)
+            })
+    return jsonify({"items": results, "query": q})
+
+@app.post('/vision/extract_from_url')
+def vision_extract_from_url():
+    body = request.get_json(silent=True) or {}
+    url = (body.get('url') or '').strip()
+    try:
+        limit = int(body.get('limit') or 6)
+    except Exception:
+        limit = 6
+    if not url:
+        return jsonify({"error": "url required"}), 400
+    try:
+        res = fetch_url(url)
+        html = res.get('content') if isinstance(res, dict) else None
+        if not html:
+            return jsonify({"error": "failed to fetch base url"}), 400
+        soup = BeautifulSoup(html, 'html.parser')
+        imgs = _extract_images(soup, url)[:limit]
+        out = []
+        for img in imgs:
+            src = img.get('src')
+            if not src:
+                continue
+            try:
+                r = requests.get(src, timeout=10)
+                r.raise_for_status()
+                data = r.content
+                pil = _open_image_from_bytes(data)
+                w = pil.width if pil is not None else None
+                h = pil.height if pil is not None else None
+                vec = _siglip_image_embed(pil) if pil is not None else None
+                ocr_txt = _ocr_image(pil)
+                vid = _vision_save_item(src, r.headers.get('Content-Type'), w, h, ocr_txt, None, {"from": url}, vec)
+                out.append({"id": vid, "url": src, "width": w, "height": h, "ocr_text": ocr_txt or ''})
+            except Exception as e:
+                app.logger.warning(f"image fetch/index failed for {src}: {e}")
+                continue
+        return jsonify({"items": out, "source": url})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 @app.get('/admin/annotations_summary')
 def admin_annotations_summary():
     try:
@@ -2919,6 +3208,47 @@ def mcp_endpoint():
                         "required": ["pair_id"]
                     }
                 },
+                {
+                    "name": "vision_status",
+                    "description": "Status of optional SigLIP-based vision (availability of model and OCR)",
+                    "inputSchema": {"type": "object", "properties": {}}
+                },
+                {
+                    "name": "vision_encode",
+                    "description": "Encode an image (url or base64 data) via SigLIP and store it for search.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "data": {"type": "string", "description": "base64 data URI or raw base64"},
+                            "include_vector": {"type": "boolean"}
+                        }
+                    }
+                },
+                {
+                    "name": "vision_search",
+                    "description": "Search indexed images by text using SigLIP text encoder.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "q": {"type": "string"},
+                            "limit": {"type": "number"}
+                        },
+                        "required": ["q"]
+                    }
+                },
+                {
+                    "name": "vision_extract_from_url",
+                    "description": "Fetch a web page, extract top images, index them with embeddings and OCR.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "url": {"type": "string"},
+                            "limit": {"type": "number"}
+                        },
+                        "required": ["url"]
+                    }
+                },
             ]
             return jsonify(_jsonrpc_result(_id, {"tools": tools}))
 
@@ -3159,6 +3489,38 @@ def mcp_endpoint():
             if name == "get_system_prompt":
                 prm = get_system_prompt()
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": prm["prompt"]}]}))
+
+            if name == "vision_status":
+                st = vision_status()
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(_resp_json(st), ensure_ascii=False)}]}))
+            if name == "vision_encode":
+                try:
+                    with app.test_request_context(json={
+                        "url": args.get("url"),
+                        "data": args.get("data"),
+                        "include_vector": args.get("include_vector")
+                    }):
+                        r = vision_encode()
+                    data = _resp_json(r)
+                except Exception as e:
+                    data = {"error": str(e)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}))
+            if name == "vision_search":
+                try:
+                    with app.test_request_context(json={"q": args.get("q"), "limit": args.get("limit")}):
+                        r = vision_search()
+                    data = _resp_json(r)
+                except Exception as e:
+                    data = {"error": str(e)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}))
+            if name == "vision_extract_from_url":
+                try:
+                    with app.test_request_context(json={"url": args.get("url"), "limit": args.get("limit")}):
+                        r = vision_extract_from_url()
+                    data = _resp_json(r)
+                except Exception as e:
+                    data = {"error": str(e)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}))
 
             if name == "pairs_search_hybrid":
                 q = _arg_str("q", "").strip()
