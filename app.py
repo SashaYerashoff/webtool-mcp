@@ -21,6 +21,7 @@ import threading
 from collections import deque, OrderedDict
 import uuid
 from dataclasses import dataclass
+import sqlite3
 
 # Optional lightweight RAG deps
 try:
@@ -30,9 +31,14 @@ try:
     try:
         import numpy as _np  # type: ignore
         from sentence_transformers import SentenceTransformer  # type: ignore
+        try:
+            from sentence_transformers import CrossEncoder  # type: ignore
+        except Exception:
+            CrossEncoder = None  # type: ignore
     except Exception:
         _np = None  # type: ignore
         SentenceTransformer = None  # type: ignore
+        CrossEncoder = None  # type: ignore
 except Exception:  # graceful fallback if not installed
     PdfReader = None  # type: ignore
     BM25Okapi = None  # type: ignore
@@ -159,6 +165,230 @@ def _extract_all_tool_jsons(raw: str) -> list[str]:
         idx = masked_text.find('"name"', idx + 6)
     return results
 
+# -------------------- Pairs storage (SQLite) --------------------
+_DB_PATH = os.getenv("WEBTOOL_DB", os.path.join(os.path.dirname(__file__), "pairs.db"))
+_DB_LOCK = threading.Lock()
+
+def _db_conn():
+    return sqlite3.connect(_DB_PATH, check_same_thread=False)
+
+def _db_init():
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pairs (
+                  id TEXT PRIMARY KEY,
+                  created_at INTEGER,
+                  agent_type TEXT,
+                  user_request TEXT,
+                  model_response TEXT,
+                  thinking TEXT,
+                  tool_use_log_json TEXT,
+                  parent_pair_id TEXT,
+                  topic TEXT,
+                  url_citations_json TEXT,
+                  tokens_est INTEGER
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pair_emb (
+                    id TEXT PRIMARY KEY,
+                    vec TEXT
+                )
+                """
+            )
+            # Annotations for fine-tuning: span-level feedback on pairs
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pair_annotations (
+                    id TEXT PRIMARY KEY,
+                    pair_id TEXT NOT NULL,
+                    created_at INTEGER,
+                    target TEXT DEFAULT 'model_response',
+                    start INTEGER,
+                    end INTEGER,
+                    text TEXT,
+                    sentiment TEXT,
+                    tags_json TEXT,
+                    note TEXT,
+                    rating INTEGER,
+                    FOREIGN KEY(pair_id) REFERENCES pairs(id)
+                )
+                """
+            )
+            con.commit()
+        finally:
+            con.close()
+
+# Initialize DB at import time to avoid decorator type-check noise
+try:
+    _db_init()
+except Exception:
+    app.logger.exception("DB init failed")
+
+def _now_ts() -> int:
+    return int(time.time())
+
+def _infer_agent_type_from_prompt(system_prompt: str | None) -> str:
+    s = (system_prompt or "").lower()
+    if "persona: deep researcher" in s or "deep researcher" in s:
+        return "researcher"
+    if "persona: news" in s or "news crawler" in s or "reporter" in s:
+        return "news"
+    if "persona: support" in s or "support agent" in s or "luxriot" in s:
+        return "support"
+    return "unknown"
+
+def _estimate_tokens(txt: str) -> int:
+    try:
+        return max(1, len((txt or "").split()))
+    except Exception:
+        return 1
+
+def _guess_topic(user_request: str, model_response: str) -> str:
+    req_head = (user_request or "").strip().splitlines()[0][:140]
+    if req_head:
+        return req_head[:80]
+    for line in (model_response or "").splitlines():
+        if len(line.strip()) >= 6:
+            return line.strip()[:80]
+    return ""
+
+def _extract_urls(text: str) -> list[dict]:
+    urls = []
+    for m in re.finditer(r"https?://[^\s)\]]+", text or ""):
+        urls.append({"url": m.group(0)})
+    return urls[:12]
+
+_SESSION_LAST_PAIR_ID: dict[str, str] = {}
+
+def _save_reasoning_enabled() -> bool:
+    val = (os.getenv("WEBTOOL_SAVE_REASONING", "0") or "").strip().lower()
+    return val in {"1","true","yes","on"}
+
+# ---- Simple tokenization for BM25 over pairs ----
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+def _tokenize(text: str) -> list[str]:
+    return [w.lower() for w in _WORD_RE.findall(text or "") if w]
+
+# ---- Embedding model (optional) ----
+_EMB_MODEL = None
+def _get_embedding_model():
+    global _EMB_MODEL
+    if _EMB_MODEL is not None:
+        return _EMB_MODEL
+    model_name = os.getenv("WEBTOOL_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+    try:
+        if SentenceTransformer is None:
+            return None
+        _EMB_MODEL = SentenceTransformer(model_name)
+        return _EMB_MODEL
+    except Exception as e:
+        app.logger.warning(f"Embedding model load failed: {e}")
+        _EMB_MODEL = None
+        return None
+
+def save_pair(session_id: str, agent_type: str, user_request: str, model_response: str, thinking: str | None, tool_use_log: list[dict] | None, parent_pair_id: str | None, topic: str | None):
+    pid = str(uuid.uuid4())
+    item = {
+        "id": pid,
+        "created_at": _now_ts(),
+        "agent_type": agent_type,
+        "user_request": user_request,
+        "model_response": model_response,
+    "thinking": (thinking or "") if _save_reasoning_enabled() else "",
+        "tool_use_log_json": json.dumps(tool_use_log or [], ensure_ascii=False),
+        "parent_pair_id": parent_pair_id or "",
+        "topic": topic or _guess_topic(user_request, model_response),
+        "url_citations_json": json.dumps(_extract_urls(model_response), ensure_ascii=False),
+        "tokens_est": _estimate_tokens(user_request) + _estimate_tokens(model_response),
+    }
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "INSERT INTO pairs (id, created_at, agent_type, user_request, model_response, thinking, tool_use_log_json, parent_pair_id, topic, url_citations_json, tokens_est) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    item["id"], item["created_at"], item["agent_type"], item["user_request"], item["model_response"], item["thinking"], item["tool_use_log_json"], item["parent_pair_id"], item["topic"], item["url_citations_json"], item["tokens_est"],
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+    _SESSION_LAST_PAIR_ID[session_id] = pid
+    # asynchronously best-effort embed (inline here, quick for MiniLM; in production use a worker)
+    try:
+        _save_pair_embedding(pid, f"{item['topic']}\n{user_request}\n{model_response}")
+    except Exception:
+        pass
+    return pid
+
+def list_pairs(agent_type: str | None = None, limit: int = 20):
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            if agent_type:
+                cur.execute("SELECT id, created_at, agent_type, user_request, model_response, topic FROM pairs WHERE agent_type=? ORDER BY created_at DESC LIMIT ?", (agent_type, limit))
+            else:
+                cur.execute("SELECT id, created_at, agent_type, user_request, model_response, topic FROM pairs ORDER BY created_at DESC LIMIT ?", (limit,))
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r[0],
+            "created_at": r[1],
+            "agent_type": r[2],
+            "user_request": r[3],
+            "model_response": r[4],
+            "topic": r[5],
+        })
+    return out
+
+def get_pair(pid: str):
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT id, created_at, agent_type, user_request, model_response, thinking, tool_use_log_json, parent_pair_id, topic, url_citations_json, tokens_est FROM pairs WHERE id=?", (pid,))
+            r = cur.fetchone()
+        finally:
+            con.close()
+    if not r:
+        return None
+    return {
+        "id": r[0],
+        "created_at": r[1],
+        "agent_type": r[2],
+        "user_request": r[3],
+        "model_response": r[4],
+        "thinking": r[5],
+        "tool_use_log": json.loads(r[6] or "[]"),
+        "parent_pair_id": r[7] or None,
+        "topic": r[8],
+        "url_citations": json.loads(r[9] or "[]"),
+        "tokens_est": r[10],
+    }
+
+def delete_pair(pid: str) -> bool:
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("DELETE FROM pairs WHERE id=?", (pid,))
+            con.commit()
+            return cur.rowcount > 0
+        finally:
+            con.close()
+
 def _load_sysprompt_file() -> str:
     try:
         with open(_SYSPROMPT_PATH, 'r', encoding='utf-8') as f:
@@ -182,7 +412,7 @@ def _load_sysprompt_file() -> str:
 
 def get_system_prompt() -> dict:
     prompt = _load_sysprompt_file()
-    return {"prompt": prompt, "version": "1.3"}
+    return {"prompt": prompt, "version": "1.5"}
 
 # -------------------------------------------------------------
 # Integrated light proxy endpoints (optional replacement for backend FastAPI)
@@ -252,7 +482,8 @@ def _sse_event(event: str, data: dict | str):
     return f"event: {event}\ndata: {payload}\n\n"
 
 # --- Encoding helpers (mojibake auto-repair) ---
-_MOJIBAKE_RE = re.compile(r"[ÃÂÐÑâœžŸ¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]")
+# Expand suspicious set to include Latvian-specific artifacts (Ä, Å) that appear when UTF-8 is mis-decoded
+_MOJIBAKE_RE = re.compile(r"[ÃÂÄÅÐÑâœžŸ¢£¥¦§¨©ª«¬®¯°±²³´µ¶·¸¹º»¼½¾¿]")
 
 def _maybe_fix_mojibake_py(text: str) -> str:
     """Best-effort fix for UTF-8 text mis-decoded as Latin-1/Win-1252.
@@ -270,11 +501,19 @@ def _maybe_fix_mojibake_py(text: str) -> str:
     if not _MOJIBAKE_RE.search(text):
         return text
     try:
+        # If the original already contains Cyrillic, do not attempt to "repair" it
+        if re.search(r"[\u0400-\u04FF]", text):
+            return text
         raw = text.encode('latin-1', 'ignore')
         fixed = raw.decode('utf-8', 'ignore')
         before = len(_MOJIBAKE_RE.findall(text))
         after = len(_MOJIBAKE_RE.findall(fixed))
-        if after < before or re.search(r"[\u0400-\u04FF]", fixed):  # Cyrillic appeared
+        # Accept fix if markers reduced, or if Cyrillic OR Latvian diacritics appear properly
+        if (
+            after < before
+            or re.search(r"[\u0400-\u04FF]", fixed)  # Cyrillic
+            or re.search(r"[āčēģīķļņōŗšūžĀČĒĢĪĶĻŅŌŖŠŪŽ]", fixed)  # Latvian letters
+        ):
             return fixed
     except Exception:
         pass
@@ -390,6 +629,7 @@ def proxy_chat_stream():
             history.insert(0, {"role": "system", "content": system_prompt})
         # Append user
         history.append({"role": "user", "content": user})
+        tool_log: list[dict] = []
 
         # Multi-pass assistant/tool loop
         assistant_content = ''
@@ -413,7 +653,11 @@ def proxy_chat_stream():
         tool_text = None
 
         # Iterate tool→assistant cycles up to a safe maximum
-        MAX_TOOL_CALLS = int(os.environ.get('WEBTOOL_MAX_TOOL_CALLS', '4'))
+        try:
+            env_max = int(os.environ.get('WEBTOOL_MAX_TOOL_CALLS', '10'))
+        except Exception:
+            env_max = 10
+        MAX_TOOL_CALLS = max(1, min(15, env_max))
         calls = 0
         while calls < MAX_TOOL_CALLS:
             # Collect all tool calls in the latest assistant text, in order
@@ -438,6 +682,10 @@ def proxy_chat_stream():
                     yield _sse_event('tool_start', {"name": name, "arguments": arguments})
                     tool_text = _mcp_tool_call(name, arguments)
                     yield _sse_event('tool', {"name": name, "content": tool_text})
+                    try:
+                        tool_log.append({"name": name, "arguments": arguments, "content_preview": (tool_text or "")[:500]})
+                    except Exception:
+                        pass
                     # Append as a tool message so the model can read it next round
                     history.append({"role": "tool", "content": tool_text, "name": name})
                 except Exception as e:
@@ -460,12 +708,21 @@ def proxy_chat_stream():
                     return
             history.append({"role": "assistant", "content": final_assistant})
 
+        # Persist pair and Done summary
+        try:
+            agent_type = _infer_agent_type_from_prompt(system_prompt)
+            parent = _SESSION_LAST_PAIR_ID.get(session_id)
+            new_pid = save_pair(session_id, agent_type, user, final_assistant, final_reasoning or None, tool_log, parent, topic=None)
+        except Exception:
+            app.logger.exception("save_pair failed")
+            new_pid = None
         # Done summary (tool_output omitted to prevent duplication in UI)
         yield _sse_event('done', {
             "session_id": session_id,
             "assistant": final_assistant,
             "assistant_reasoning": final_reasoning,
-            "tool_output": None
+            "tool_output": None,
+            "pair_id": new_pid
         })
 
     headers = {
@@ -479,6 +736,276 @@ def proxy_chat_stream():
 @app.route('/proxy/session/<sid>', methods=['GET'])
 def proxy_session(sid: str):
     return jsonify({"session_id": sid, "messages": _CHAT_SESSIONS.get(sid, [])})
+
+@app.get('/pairs')
+def http_list_pairs():
+    agent = request.args.get('agent') or None
+    try:
+        limit = int(request.args.get('limit') or '20')
+    except Exception:
+        limit = 20
+    return jsonify({"items": list_pairs(agent, limit=limit)})
+
+@app.get('/pairs/<pid>')
+def http_get_pair(pid: str):
+    item = get_pair(pid)
+    if not item:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(item)
+
+@app.delete('/pairs/<pid>')
+def http_delete_pair(pid: str):
+    ok = delete_pair(pid)
+    if not ok:
+        return jsonify({"deleted": False, "error": "not found"}), 404
+    return jsonify({"deleted": True, "id": pid})
+
+@app.post('/pairs/<pid>/annotations')
+def http_create_annotation(pid: str):
+    body = request.get_json(silent=True) or {}
+    # Validate pair exists
+    if not get_pair(pid):
+        return jsonify({"error": "pair not found"}), 404
+    ann_id = str(uuid.uuid4())
+    created_at = _now_ts()
+    target = str(body.get('target') or 'model_response')
+    start = body.get('start')
+    end = body.get('end')
+    try:
+        start_i = int(start) if start is not None else None
+        end_i = int(end) if end is not None else None
+    except Exception:
+        return jsonify({"error": "start/end must be integers"}), 400
+    text = str(body.get('text') or '')
+    sentiment = str(body.get('sentiment') or '')  # 'positive' | 'negative' | ''
+    tags = body.get('tags') or []
+    if not isinstance(tags, list):
+        tags = []
+    try:
+        tags_json = json.dumps([str(t) for t in tags], ensure_ascii=False)
+    except Exception:
+        tags_json = json.dumps([])
+    note = str(body.get('note') or '')
+    rating_val = body.get('rating')
+    try:
+        if rating_val is None or str(rating_val).strip() == "":
+            rating = None
+        else:
+            rating = int(str(rating_val))
+    except Exception:
+        rating = None
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "INSERT INTO pair_annotations (id, pair_id, created_at, target, start, end, text, sentiment, tags_json, note, rating) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (ann_id, pid, created_at, target, start_i, end_i, text, sentiment, tags_json, note, rating)
+            )
+            con.commit()
+        finally:
+            con.close()
+    return jsonify({
+        "id": ann_id,
+        "pair_id": pid,
+        "created_at": created_at,
+        "target": target,
+        "start": start_i,
+        "end": end_i,
+        "text": text,
+        "sentiment": sentiment,
+        "tags": json.loads(tags_json),
+        "note": note,
+        "rating": rating,
+    })
+
+@app.get('/pairs/<pid>/annotations')
+def http_list_annotations(pid: str):
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("SELECT id, created_at, target, start, end, text, sentiment, tags_json, note, rating FROM pair_annotations WHERE pair_id=? ORDER BY created_at DESC", (pid,))
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    items = []
+    for r in rows:
+        items.append({
+            "id": r[0],
+            "pair_id": pid,
+            "created_at": r[1],
+            "target": r[2],
+            "start": r[3],
+            "end": r[4],
+            "text": r[5],
+            "sentiment": r[6],
+            "tags": json.loads(r[7] or "[]"),
+            "note": r[8],
+            "rating": r[9],
+        })
+    return jsonify({"items": items})
+
+@app.delete('/pairs/<pid>/annotations/<ann_id>')
+def http_delete_annotation(pid: str, ann_id: str):
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("DELETE FROM pair_annotations WHERE id=? AND pair_id=?", (ann_id, pid))
+            con.commit()
+            ok = cur.rowcount > 0
+        finally:
+            con.close()
+    if not ok:
+        return jsonify({"deleted": False, "error": "not found"}), 404
+    return jsonify({"deleted": True, "id": ann_id})
+
+@app.post('/pairs/search')
+def http_search_pairs():
+    body = request.get_json(silent=True) or {}
+    q = (body.get('q') or body.get('query') or '').strip()
+    agent = (body.get('agent') or None)
+    limit = int(body.get('limit') or 20)
+    if not q:
+        return jsonify({"items": list_pairs(agent, limit=limit)})
+    pattern = f"%{q.replace('%','').replace('_','')}%"
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            if agent:
+                cur.execute("SELECT id, created_at, agent_type, user_request, model_response, topic FROM pairs WHERE agent_type=? AND (user_request LIKE ? OR model_response LIKE ? OR topic LIKE ?) ORDER BY created_at DESC LIMIT ?", (agent, pattern, pattern, pattern, limit))
+            else:
+                cur.execute("SELECT id, created_at, agent_type, user_request, model_response, topic FROM pairs WHERE (user_request LIKE ? OR model_response LIKE ? OR topic LIKE ?) ORDER BY created_at DESC LIMIT ?", (pattern, pattern, pattern, limit))
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    items = []
+    for r in rows:
+        items.append({"id": r[0], "created_at": r[1], "agent_type": r[2], "user_request": r[3], "model_response": r[4], "topic": r[5]})
+    return jsonify({"items": items, "query": q})
+
+def _pair_text_for_index(item: dict) -> str:
+    return f"{item.get('topic','')}\n{item.get('user_request','')}\n{item.get('model_response','')}"
+
+def _embed_text(text: str):
+    model = _get_embedding_model()
+    if not model:
+        return None
+    try:
+        vec = model.encode([text])[0]
+        # return as list[float] for cosine
+        return vec.tolist() if hasattr(vec, 'tolist') else list(vec)
+    except Exception as e:
+        app.logger.warning(f"embed failed: {e}")
+        return None
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    try:
+        import math
+        if not a or not b or len(a)!=len(b):
+            return 0.0
+        dot = sum(x*y for x,y in zip(a,b))
+        na = math.sqrt(sum(x*x for x in a))
+        nb = math.sqrt(sum(y*y for y in b))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot/(na*nb)
+    except Exception:
+        return 0.0
+
+def _load_pair_embeddings(ids: list[str]) -> dict[str, list[float]]:
+    if not ids:
+        return {}
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            qmarks = ','.join(['?']*len(ids))
+            cur.execute(f"SELECT id, vec FROM pair_emb WHERE id IN ({qmarks})", tuple(ids))
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    out: dict[str, list[float]] = {}
+    for pid, vec_json in rows:
+        try:
+            out[pid] = json.loads(vec_json)
+        except Exception:
+            continue
+    return out
+
+def _save_pair_embedding(pid: str, text: str):
+    vec = _embed_text(text)
+    if vec is None:
+        return
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute("REPLACE INTO pair_emb (id, vec) VALUES (?,?)", (pid, json.dumps(vec)))
+            con.commit()
+        finally:
+            con.close()
+
+@app.post('/pairs/search_hybrid')
+def http_search_pairs_hybrid():
+    body = request.get_json(silent=True) or {}
+    q = (body.get('q') or body.get('query') or '').strip()
+    agent = (body.get('agent') or None)
+    limit = int(body.get('limit') or 20)
+    if not q:
+        return jsonify({"items": list_pairs(agent, limit=limit)})
+    # Load recent N candidates then score
+    pool = list_pairs(agent, limit=200)
+    tokens_q = set(_tokenize(q))
+    # Try embedding query
+    qvec = _embed_text(q)
+    # Load vectors for pool
+    pool_ids = [it['id'] for it in pool]
+    vecs = _load_pair_embeddings(pool_ids)
+    scored: list[tuple[float, dict]] = []
+    for it in pool:
+        text = _pair_text_for_index(it)
+        # term overlap heuristic (BM25-lite)
+        toks = set(_tokenize(text))
+        overlap = len(tokens_q & toks)
+        bm25_like = overlap / max(1, len(tokens_q))
+        # embedding cosine
+        cos = 0.0
+        v = vecs.get(it['id'])
+        if v is None and qvec is not None:
+            # lazily build and store embedding for this item
+            _save_pair_embedding(it['id'], text)
+            v = _load_pair_embeddings([it['id']]).get(it['id'])
+        if v is not None and qvec is not None:
+            cos = _cosine(qvec, v)
+        # hybrid score
+        score = 0.6 * cos + 0.4 * bm25_like
+        scored.append((score, it))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    items = [it for _, it in scored[:limit]]
+    return jsonify({"items": items, "query": q, "method": "hybrid"})
+
+@app.post('/pairs/attach')
+def http_attach_pair():
+    body = request.get_json(silent=True) or {}
+    pid = (body.get('id') or body.get('pair_id') or '').strip()
+    session_id = (body.get('session_id') or '').strip()
+    if not pid or not session_id:
+        return jsonify({"error": "id and session_id required"}), 400
+    item = get_pair(pid)
+    if not item:
+        return jsonify({"error": "pair not found"}), 404
+    # Insert as separate messages to mirror actual conversation
+    hist = _CHAT_SESSIONS.setdefault(session_id, [])
+    ur = item.get('user_request') or ''
+    mr = item.get('model_response') or ''
+    if ur:
+        hist.append({"role": "user", "content": ur})
+    if mr:
+        hist.append({"role": "assistant", "content": mr})
+    return jsonify({"attached": True, "session_id": session_id, "pair_id": pid})
 
 @app.route('/proxy/tool', methods=['POST', 'OPTIONS'])
 def proxy_tool():
@@ -531,11 +1058,15 @@ def _decode_html_response(resp: requests.Response) -> str:
                 return txt
         except Exception:
             pass
-        if "â" in txt or "Ã" in txt:
+        if "â" in txt or "Ã" in txt or "Ä" in txt or "Å" in txt:
             try:
                 fixed = txt.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
                 # Only keep if it reduces mojibake markers and does not drastically shrink text
-                if (fixed.count("â") + fixed.count("Ã")) < (txt.count("â") + txt.count("Ã")) and len(fixed) > len(txt) * 0.5:
+                if (
+                    (fixed.count("â") + fixed.count("Ã") + fixed.count("Ä") + fixed.count("Å"))
+                    < (txt.count("â") + txt.count("Ã") + txt.count("Ä") + txt.count("Å"))
+                    and len(fixed) > len(txt) * 0.5
+                ) or re.search(r"[āčēģīķļņōŗšūžĀČĒĢĪĶĻŅŌŖŠŪŽ]", fixed) or re.search(r"[\u0400-\u04FF]", fixed):
                     return fixed
             except Exception:
                 pass
@@ -844,7 +1375,7 @@ def available_functions_info() -> dict:
     info = {
         "status": "ok",
         "functions": {
-            "fetch_url": {"args": {"url": "string", "chunk_id": "string?", "mode": "string? (outline)", "link_id": "string? (e.g. L7)"}},
+            "fetch_url": {"args": {"url": "string", "chunk_id": "string?", "mode": "string? (outline|images)", "link_id": "string? (e.g. L7)"}},
             "search_wikipedia": {"args": {"query": "string"}},
             "latvian_news": {"args": {"query": "string?"}},
             "search_duckduckgo": {"args": {"query": "string"}},
@@ -878,6 +1409,22 @@ def _jsonrpc_error(_id, code, message, data=None):
     if data is not None:
         err["data"] = data
     return {"jsonrpc": "2.0", "id": _id, "error": err}
+
+def _resp_json(res):
+    """Best-effort extract JSON payload from Flask Response or (Response, status) tuple."""
+    try:
+        # Direct Response
+        if hasattr(res, 'get_json'):
+            return res.get_json()
+        # Tuple (Response, status)
+        if isinstance(res, tuple) and len(res) >= 1 and hasattr(res[0], 'get_json'):
+            return res[0].get_json()
+        # Already a dict
+        if isinstance(res, dict):
+            return res
+    except Exception:
+        pass
+    return {"ok": False}
 
 
 def _sse_stream():
@@ -940,6 +1487,62 @@ def admin_clear_caches():
         return jsonify({"cleared": True})
     except Exception as e:
         return jsonify({"cleared": False, "error": str(e)}), 500
+
+@app.get('/admin/annotations_export')
+def admin_annotations_export():
+    fmt = (request.args.get('format') or 'jsonl').lower()
+    # Join annotations with core pair info for fine-tuning datasets
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            cur.execute(
+                """
+                SELECT a.id, a.pair_id, a.created_at, a.target, a.start, a.end, a.text, a.sentiment, a.tags_json, a.note, a.rating,
+                       p.created_at as pair_created_at, p.agent_type, p.user_request, p.model_response, p.topic
+                FROM pair_annotations a
+                JOIN pairs p ON p.id = a.pair_id
+                ORDER BY a.created_at DESC
+                """
+            )
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    items = []
+    for r in rows:
+        try:
+            tags = json.loads(r[8] or '[]')
+        except Exception:
+            tags = []
+        items.append({
+            "annotation_id": r[0],
+            "pair_id": r[1],
+            "annotation_created_at": r[2],
+            "target": r[3],
+            "start": r[4],
+            "end": r[5],
+            "selected_text": r[6],
+            "sentiment": r[7],
+            "tags": tags,
+            "note": r[9],
+            "rating": r[10],
+            "pair_created_at": r[11],
+            "agent_type": r[12],
+            "user_request": r[13],
+            "model_response": r[14],
+            "topic": r[15],
+        })
+    if fmt == 'json':
+        return jsonify({"items": items, "count": len(items)})
+    # default jsonl
+    def generate():
+        for obj in items:
+            yield json.dumps(obj, ensure_ascii=False) + "\n"
+    headers = {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Disposition': 'attachment; filename="annotations.jsonl"'
+    }
+    return Response(generate(), headers=headers)
 
 _rate_lock = threading.Lock()
 _fetch_timestamps = deque()  # timestamps of fetch_url network fetches
@@ -1022,6 +1625,12 @@ LUXRIOT_DEFAULT_FILES = [
     os.environ.get("LUXRIOT_MONITOR_GUIDE", os.path.join(os.getcwd(), "Luxriot-EVO-Monitor-User-Guide.pdf")),
 ]
 LUXRIOT_INDEX_PATH = os.environ.get("LUXRIOT_INDEX", os.path.join(os.getcwd(), "luxriot_index.pkl"))
+# Tunables
+LUXRIOT_CHARS_PER_CHUNK = int(os.environ.get("LUXRIOT_CHARS_PER_CHUNK", "1400"))
+LUXRIOT_CHUNK_OVERLAP = int(os.environ.get("LUXRIOT_CHUNK_OVERLAP", "200"))
+LUXRIOT_HYBRID_ALPHA = float(os.environ.get("LUXRIOT_HYBRID_ALPHA", "0.6"))  # weight for semantic vs BM25
+LUXRIOT_EMBED_CACHE = os.environ.get("LUXRIOT_EMBED_CACHE", os.path.join(os.getcwd(), "luxriot_embed.npy"))
+LUXRIOT_RERANK_MODEL = os.environ.get("LUXRIOT_RERANK_MODEL")  # e.g., cross-encoder/ms-marco-MiniLM-L-6-v2
 
 _luxriot_lock = threading.Lock()
 _luxriot_index = None  # type: ignore
@@ -1052,10 +1661,12 @@ class LuxriotIndex:
         return re.findall(r"[a-zA-Z0-9]{2,}", (text or "").lower())
 
     def _chunk_pages(self, reader, file_path: str, doc_name: str):
-        # Accumulate per ~1400 chars with carryover
+        # Accumulate per configured chars with overlap carryover between chunks
         buf = ""
         start_page = 0
         chunk_idx = 0
+        max_len = max(400, int(LUXRIOT_CHARS_PER_CHUNK))
+        overlap = max(0, int(LUXRIOT_CHUNK_OVERLAP))
         for i, page in enumerate(reader.pages):
             try:
                 txt = page.extract_text() or ""
@@ -1066,11 +1677,17 @@ class LuxriotIndex:
             if not buf:
                 start_page = i
             buf += ("\n" if buf else "") + txt
-            if len(buf) >= 1400:
+            if len(buf) >= max_len:
                 chunk_idx += 1
                 cid = f"{doc_name}:{start_page+1}-{i+1}#{chunk_idx}"
                 self.chunks.append(LuxriotChunk(id=cid, doc=doc_name, file=file_path, page_start=start_page+1, page_end=i+1, text=buf.strip()))
-                buf = ""
+                if overlap > 0:
+                    tail = buf[-overlap:]
+                    buf = tail
+                    # next chunk logically still includes current page
+                    start_page = max(i, 0)
+                else:
+                    buf = ""
         if buf.strip():
             chunk_idx += 1
             cid = f"{doc_name}:{start_page+1}-{len(reader.pages)}#{chunk_idx}"
@@ -1106,9 +1723,70 @@ class LuxriotIndex:
             try:
                 model = SentenceTransformer(model_name)
                 self.embed_model_name = model_name
-                self.embeddings = model.encode([c.text for c in self.chunks], normalize_embeddings=True)
+                import numpy as np
+                try:
+                    if LUXRIOT_EMBED_CACHE and os.path.exists(LUXRIOT_EMBED_CACHE):
+                        self.embeddings = np.load(LUXRIOT_EMBED_CACHE)
+                        if self.embeddings.shape[0] != len(self.chunks):
+                            self.embeddings = None
+                except Exception:
+                    self.embeddings = None
+                if self.embeddings is None:
+                    self.embeddings = model.encode([c.text for c in self.chunks], normalize_embeddings=True)
+                    try:
+                        if LUXRIOT_EMBED_CACHE:
+                            np.save(LUXRIOT_EMBED_CACHE, self.embeddings)
+                    except Exception:
+                        pass
             except Exception as e:
                 app.logger.warning(f"Luxriot embeddings build failed: {e}")
+
+    @staticmethod
+    def _expand_query_terms(q: str) -> list[str]:
+        # Simple synonym expansion for Luxriot domain
+        synonyms: dict[str, list[str]] = {
+            "failover": ["redundancy", "ha", "high", "availability", "cluster"],
+            "archive": ["storage", "retention", "long-term", "backup"],
+            "monitor": ["client", "viewer", "ui", "display"],
+            "server": ["service", "core"],
+            "license": ["licensing", "activation", "key"],
+            "database": ["sql", "postgres", "postgresql"],
+            "recording": ["stream", "ingest"],
+            "camera": ["ip", "device"],
+        }
+        toks = LuxriotIndex._tokenize(q)
+        expanded = toks[:]
+        for t in toks:
+            if t in synonyms:
+                expanded.extend(synonyms[t])
+        # light boost by duplicating originals
+        expanded.extend(toks)
+        return expanded
+
+    @staticmethod
+    def _make_snippet(text: str, terms: list[str], max_len: int = 500) -> str:
+        if not text:
+            return ""
+        tset = {t.lower() for t in terms if len(t) >= 3}
+        lower = text.lower()
+        pos = -1
+        hit = None
+        for t in tset:
+            p = lower.find(t)
+            if p != -1 and (pos == -1 or p < pos):
+                pos = p
+                hit = t
+        if pos == -1:
+            return text[:max_len].replace('\n', ' ')
+        start = max(0, pos - max_len // 2)
+        end = min(len(text), start + max_len)
+        snippet = text[start:end].replace('\n', ' ')
+        if hit:
+            try:
+                snippet = re.sub(fr"(?i)\b{re.escape(hit)}\b", r"**\\g<0>**", snippet)
+            except Exception:
+                pass
+        return snippet
 
     def to_dict(self) -> dict:
         return {
@@ -1160,7 +1838,7 @@ class LuxriotIndex:
     def search(self, query: str, k: int = 5, doc: str | None = None) -> list[dict]:
         if not self.bm25 or not self.chunks:
             return []
-        qtok = self._tokenize(query)
+        qtok = self._expand_query_terms(query)
         if not qtok:
             return []
         scores = self.bm25.get_scores(qtok)
@@ -1171,7 +1849,7 @@ class LuxriotIndex:
             if doc and doc.lower() not in ck.doc.lower():
                 continue
             score = float(scores[i])
-            snippet = ck.text[:500].replace('\n', ' ')
+            snippet = self._make_snippet(ck.text, qtok, 500)
             out.append({
                 "chunk_id": ck.id,
                 "doc": ck.doc,
@@ -1211,7 +1889,7 @@ class LuxriotIndex:
                     "doc": ck.doc,
                     "pages": f"{ck.page_start}-{ck.page_end}",
                     "score": float(sims[int(i)]),
-                    "snippet": ck.text[:500].replace('\n', ' '),
+                    "snippet": self._make_snippet(ck.text, LuxriotIndex._tokenize(query), 500),
                 })
                 if len(out) >= k:
                     break
@@ -1219,6 +1897,83 @@ class LuxriotIndex:
         except Exception as e:
             app.logger.warning(f"semantic_search failed: {e}")
             return []
+
+    def search_hybrid(self, query: str, k: int = 5, doc: str | None = None) -> list[dict]:
+        if not self.chunks:
+            return []
+        # BM25 part
+        bm_items = []
+        bm_scores = []
+        if self.bm25 is not None:
+            bm = self.search(query, k=len(self.chunks), doc=doc)
+            bm_items = bm
+            bm_scores = [it["score"] for it in bm]
+        # Semantic part
+        sem_items = []
+        sem_scores = []
+        if SentenceTransformer is not None and _np is not None and os.environ.get("LUXRIOT_EMBED_MODEL"):
+            sem = self.semantic_search(query, k=len(self.chunks), doc=doc)
+            sem_items = sem
+            sem_scores = [it["score"] for it in sem]
+        # Build index maps
+        def to_map(items):
+            m = {}
+            for it in items:
+                m[it["chunk_id"]] = it
+            return m
+        bm_map = to_map(bm_items)
+        sem_map = to_map(sem_items)
+        # Normalization helpers
+        def normalize(vals):
+            if not vals:
+                return lambda x: 0.0
+            vmin, vmax = min(vals), max(vals)
+            if vmax <= vmin + 1e-9:
+                return lambda x: 0.0
+            return lambda x: (x - vmin) / (vmax - vmin)
+        bm_norm = normalize(bm_scores)
+        sem_norm = normalize(sem_scores)
+        # Blend
+        seen = set()
+        all_ids = list({*bm_map.keys(), *sem_map.keys()})
+        scored = []
+        for cid in all_ids:
+            b = bm_norm(bm_map.get(cid, {}).get("score", 0.0))
+            s = sem_norm(sem_map.get(cid, {}).get("score", 0.0))
+            hybrid = float(LUXRIOT_HYBRID_ALPHA) * s + (1.0 - float(LUXRIOT_HYBRID_ALPHA)) * b
+            # pick a representative item (prefer bm entry for stable pages/snippet)
+            base = bm_map.get(cid) or sem_map.get(cid)
+            if not base:
+                continue
+            seen.add(cid)
+            scored.append((hybrid, base))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        # Optional cross-encoder rerank of the top N
+        reranked = scored
+        try:
+            if LUXRIOT_RERANK_MODEL and 'CrossEncoder' in globals() and CrossEncoder is not None:
+                topN = min(25, len(scored))
+                ce = CrossEncoder(LUXRIOT_RERANK_MODEL)
+                pairs = [(query, (bm_map.get(it["chunk_id"], it).get("snippet") or it.get("snippet") or "")) for _, it in scored[:topN]]
+                import numpy as np
+                scores_ce = ce.predict(pairs)
+                reranked = list(zip(scores_ce, [it for _, it in scored[:topN]]))
+                reranked.sort(key=lambda t: float(t[0]), reverse=True)
+        except Exception as e:
+            app.logger.warning(f"Luxriot rerank failed: {e}")
+            reranked = scored
+        out = []
+        for sc, it in reranked[:k]:
+            out.append({
+                "chunk_id": it["chunk_id"],
+                "doc": it["doc"],
+                "pages": it["pages"],
+                "score": round(float(sc), 4),
+                "snippet": it.get("snippet") or "",
+                "bm25": round(float(bm_map.get(it["chunk_id"], {}).get("score", 0.0)), 4),
+                "semantic": round(float(sem_map.get(it["chunk_id"], {}).get("score", 0.0)), 4),
+            })
+        return out
 
     def get(self, chunk_id: str) -> dict | None:
         for c in self.chunks:
@@ -1281,7 +2036,14 @@ def luxriot_status():
     idx = _luxriot_ensure_index()
     if not idx:
         return jsonify({"ready": False})
-    return jsonify({"ready": True, "files": idx.files, "chunks": len(idx.chunks), "built_at": idx.built_at})
+    return jsonify({
+        "ready": True,
+        "files": idx.files,
+        "chunks": len(idx.chunks),
+        "built_at": idx.built_at,
+        "embed_model": idx.embed_model_name,
+        "has_embeddings": bool(getattr(idx, 'embeddings', None) is not None)
+    })
 
 
 @app.route('/luxriot/search', methods=['GET'])
@@ -1295,6 +2057,19 @@ def luxriot_search():
     if not idx:
         return jsonify({"ready": False, "items": []})
     return jsonify({"ready": True, "items": idx.search(q, k=k, doc=doc)})
+
+
+@app.route('/luxriot/search_hybrid', methods=['GET'])
+def luxriot_search_hybrid():
+    q = request.args.get('q') or request.args.get('query')
+    k = int(request.args.get('k') or 5)
+    doc = request.args.get('doc')
+    if not q:
+        return jsonify({"error": "q is required"}), 400
+    idx = _luxriot_ensure_index()
+    if not idx:
+        return jsonify({"ready": False, "items": []})
+    return jsonify({"ready": True, "items": idx.search_hybrid(q, k=k, doc=doc)})
 
 
 @app.route('/luxriot/get', methods=['GET'])
@@ -1348,6 +2123,124 @@ def _extract_nav_links(soup: BeautifulSoup, base_url: str) -> list[dict]:
         seen.add(key)
         dedup.append(item)
     return dedup[:50]
+
+def _absolute_url(base_url: str, href: str | None) -> str | None:
+    if not href:
+        return None
+    try:
+        return urljoin(base_url, href)
+    except Exception:
+        return href
+
+_IMG_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|gif|bmp|svg)(?:\?.*)?$", re.I)
+
+def _guess_image_width_from_url(u: str) -> int | None:
+    """Best-effort width guess from common patterns like '/250px-' or query 'w=640'."""
+    try:
+        # Wikipedia-style thumbnail path contains '/<N>px-'
+        m = re.search(r"/(\d{2,4})px-", u)
+        if m:
+            return int(m.group(1))
+        # Look for common query params w= or width=
+        q = urlparse(u).query
+        if q:
+            qm = re.search(r"(?:^|&)w(?:idth)?=(\d{2,4})(?:&|$)", q)
+            if qm:
+                return int(qm.group(1))
+    except Exception:
+        pass
+    return None
+
+_IMG_ICON_WORDS = re.compile(r"\b(?:logo|icon|sprite|favicon|avatar|button|badge|tracker)\b", re.I)
+_IMG_MAP_FLAG = re.compile(r"\b(?:map|flag)\b", re.I)
+_IMG_PHOTO_EXT_SCORE = {"jpg": 3, "jpeg": 3, "webp": 3, "png": 2, "gif": 1, "bmp": 1, "svg": 0}
+
+def _filename_from_url(u: str) -> str:
+    try:
+        path = urlparse(u).path
+        return os.path.basename(path)
+    except Exception:
+        return u
+
+def _extract_images(soup: BeautifulSoup, base_url: str) -> list[dict]:
+    """Collect best-effort page images: og:image, twitter:image, then main <img> sources.
+    Filters data: URIs and very small icons. Returns list of dicts with src, alt, filename, width_guess.
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+    def _add(src: str | None, alt: str = ""):
+        if not src:
+            return
+        if src.startswith("data:"):
+            return
+        u = _absolute_url(base_url, src) or src
+        # basic extension match; allow common web image types
+        if not _IMG_EXT_RE.search(u):
+            parsed = urlparse(u)
+            if not parsed.netloc:
+                return
+        key = u
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({
+            "src": u,
+            "alt": _collapse(alt),
+            "filename": _filename_from_url(u),
+            "width_guess": _guess_image_width_from_url(u),
+        })
+    # Meta OG/Twitter first
+    for sel, attr in (("meta[property='og:image']", "content"), ("meta[name='twitter:image']", "content")):
+        try:
+            for m in soup.select(sel):
+                val = m.get(attr)
+                _add(val if isinstance(val, str) else None)
+        except Exception:
+            pass
+    # Main content imgs
+    main = _select_main(soup)
+    for img in main.find_all("img")[:60]:
+        src = img.get("src") or img.get("data-src") or img.get("data-original")
+        alt = img.get("alt") or ""
+        _add(src, alt)
+    return out[:12]
+
+
+def _score_image_for_thumb(img: dict) -> float:
+    """Score image for thumbnail suitability: prefer photos with mid-size width, non-icon keywords, useful alt.
+    Higher is better.
+    """
+    src = str(img.get("src") or "")
+    alt = str(img.get("alt") or "")
+    fn = str(img.get("filename") or "")
+    ext = fn.split(".")[-1].lower() if "." in fn else ""
+    width = img.get("width_guess") or 0
+    score = 0.0
+    # Extension/photo type weight
+    score += _IMG_PHOTO_EXT_SCORE.get(ext, 0)
+    # Prefer mid-size thumbnails (200-600px), slightly reward larger up to 1200
+    if width:
+        if 180 <= width <= 600:
+            score += 3.0
+        elif 120 < width < 180:
+            score += 1.0
+        elif 600 < width <= 1200:
+            score += 1.0
+    # Penalize icons/logos/maps/flags
+    if _IMG_ICON_WORDS.search(src) or _IMG_ICON_WORDS.search(fn) or _IMG_ICON_WORDS.search(alt):
+        score -= 3.0
+    if _IMG_MAP_FLAG.search(src) or _IMG_MAP_FLAG.search(fn) or _IMG_MAP_FLAG.search(alt):
+        score -= 1.5
+    # Prefer non-empty descriptive alt text
+    if len(alt.strip()) >= 6:
+        score += 1.5
+    return score
+
+def _top_thumbnail_images(images: list[dict], k: int = 2) -> list[dict]:
+    if not images:
+        return []
+    scored = sorted(images, key=_score_image_for_thumb, reverse=True)
+    return [img for img in scored[:k] if _score_image_for_thumb(img) > 0]
 
 
 def _iter_text_nodes(node: Tag):
@@ -1504,6 +2397,7 @@ def format_structured_page(html: str, url: str, chunk_id: str | None = None, mod
     full_text = " \n".join(c["text"] for c in chunks if c.get("text"))
     links = _gather_links(main, url)
     nav_links = _extract_nav_links(soup, url)
+    images = _extract_images(soup, url)
     outline_lines = _derive_outline(chunks)
 
     if mode == 'outline':
@@ -1514,9 +2408,23 @@ def format_structured_page(html: str, url: str, chunk_id: str | None = None, mod
             f"{c.get('id')} lvl={c.get('level')} tokens~{c.get('tokens','?')} {str(c.get('heading',''))[:120]}"
             for c in chunks[:60]
         ]
+        thumbs = _top_thumbnail_images(images, 2)
         parts = [
             'META', f'source: {url}', f'fetched_at: {_now_iso()}', f'title: {title}', f'description: {meta_desc}' if meta_desc else '', '',
-            'OUTLINE', *outline_lines[:80], '', 'LINKS', *(link_lines or ['(none)']), '', 'CHUNKS', *chunk_index_lines, '', 'NEXT', 'Request a section id (e.g. sec-2) or follow a link (e.g. L5).']
+            'OUTLINE', *outline_lines[:80], '',
+            'LINKS', *(link_lines or ['(none)']), '',
+            'THUMBS', *( [f"![{(img.get('alt') or img.get('filename') or '')[:60]}]({img.get('src')})" for img in thumbs] or ['(none)'] ), '',
+            'IMAGES', *( [f"![{(img.get('alt') or '')[:60]}]({img.get('src')})" for img in images[:8]] or ['(none)'] ), '',
+            'CHUNKS', *chunk_index_lines, '', 'NEXT', 'Request a section id (e.g. sec-2) or follow a link (e.g. L5).']
+        return "\n".join([p for p in parts if p])
+
+    if mode == 'images':
+        thumbs = _top_thumbnail_images(images, 2)
+        parts = [
+            'META', f'source: {url}', f'fetched_at: {_now_iso()}', f'title: {title}', '',
+            'THUMBS', *( [f"![{(img.get('alt') or img.get('filename') or '')[:60]}]({img.get('src')})" for img in thumbs] or ['(none)'] ), '',
+            'IMAGES', *( [f"{img.get('filename') or ''} | alt=\"{(img.get('alt') or '')[:80]}\" | w~{img.get('width_guess') or '?'} — {img.get('src')}" for img in images[:12]] or ['(none)'] ),
+        ]
         return "\n".join([p for p in parts if p])
 
     # Focus mode if chunk_id requested
@@ -1772,6 +2680,19 @@ def mcp_endpoint():
                     },
                 },
                 {
+                    "name": "luxriot_docs_search_hybrid",
+                    "description": "Hybrid search over Luxriot manuals (BM25 + semantic if available). Params: query, k, doc.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "k": {"type": "number"},
+                            "doc": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    },
+                },
+                {
                     "name": "luxriot_docs_get",
                     "description": "Get full text of a Luxriot chunk by chunk_id.",
                     "inputSchema": {
@@ -1779,6 +2700,56 @@ def mcp_endpoint():
                         "properties": {"chunk_id": {"type": "string", "description": "Chunk id returned by luxriot_docs_search"}},
                         "required": ["chunk_id"]
                     },
+                },
+                {
+                    "name": "pairs_search_hybrid",
+                    "description": "Search saved conversation pairs (memories) using hybrid semantic + token overlap. Returns a small JSON list.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "q": {"type": "string", "description": "Search query"},
+                            "agent": {"type": "string", "description": "Optional filter: researcher|news|support"},
+                            "limit": {"type": "number", "description": "Max results (default 10)"}
+                        },
+                        "required": ["q"]
+                    }
+                },
+                {
+                    "name": "pairs_get",
+                    "description": "Get a saved pair by id (returns user_request, model_response, topic).",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "required": ["id"]
+                    }
+                },
+                {
+                    "name": "pairs_annotate",
+                    "description": "Create an annotation for a pair (span-level or note). Params: pair_id, target, start, end, text, sentiment, tags, note, rating.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "pair_id": {"type": "string"},
+                            "target": {"type": "string"},
+                            "start": {"type": "number"},
+                            "end": {"type": "number"},
+                            "text": {"type": "string"},
+                            "sentiment": {"type": "string"},
+                            "tags": {"type": "array", "items": {"type": "string"}},
+                            "note": {"type": "string"},
+                            "rating": {"type": "number"}
+                        },
+                        "required": ["pair_id"]
+                    }
+                },
+                {
+                    "name": "pairs_list_annotations",
+                    "description": "List annotations for a pair. Params: pair_id.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"pair_id": {"type": "string"}},
+                        "required": ["pair_id"]
+                    }
                 },
             ]
             return jsonify(_jsonrpc_result(_id, {"tools": tools}))
@@ -1812,7 +2783,11 @@ def mcp_endpoint():
                 v = args.get(key)
                 if v is None:
                     return None
-                return str(v)
+                try:
+                    s = str(v)
+                    return s
+                except Exception:
+                    return None
             def _arg_int(key: str, default: int) -> int:
                 v = args.get(key, default)
                 try:
@@ -2017,6 +2992,66 @@ def mcp_endpoint():
                 prm = get_system_prompt()
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": prm["prompt"]}]}))
 
+            if name == "pairs_search_hybrid":
+                q = _arg_str("q", "").strip()
+                agent = _arg_opt_str("agent")
+                limit = _arg_int("limit", 10)
+                body = {"q": q, "agent": agent, "limit": limit}
+                try:
+                    with app.test_request_context(json=body):
+                        res = http_search_pairs_hybrid()
+                    # Flask Response -> get_json via direct call not guaranteed; fallback to dict if available
+                    if hasattr(res, "get_json"):
+                        payload = res.get_json()
+                    else:
+                        payload = res[0].get_json() if isinstance(res, tuple) else res
+                except Exception as e:
+                    payload = {"error": str(e)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False)}]}))
+
+            if name == "pairs_get":
+                pid = _arg_str("id", "").strip()
+                if not pid:
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps({"error":"id required"})}]}))
+                item = get_pair(pid)
+                if not item:
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps({"error":"not found"})}]}))
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(item, ensure_ascii=False)}]}))
+
+            if name == "pairs_annotate":
+                pid = _arg_str("pair_id", "").strip()
+                if not pid:
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps({"error":"pair_id required"})}]}))
+                payload = {
+                    "target": _arg_str("target", "model_response"),
+                    "start": args.get("start"),
+                    "end": args.get("end"),
+                    "text": _arg_str("text", ""),
+                    "sentiment": _arg_str("sentiment", ""),
+                    "tags": args.get("tags") if isinstance(args.get("tags"), list) else [],
+                    "note": _arg_str("note", ""),
+                    "rating": args.get("rating"),
+                }
+                try:
+                    with app.test_request_context(json=payload):
+                        res = http_create_annotation(pid)
+                    data = _resp_json(res)
+                except Exception as e:
+                    data = {"error": str(e)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}))
+
+            if name == "pairs_list_annotations":
+                pid = _arg_str("pair_id", "").strip()
+                if not pid:
+                    return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps({"error":"pair_id required"})}]}))
+                try:
+                    with app.test_request_context():
+                        res = http_list_annotations(pid)
+                    data = _resp_json(res)
+                except Exception as e:
+                    data = {"error": str(e)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}]}))
+
             if name == "luxriot_docs_status":
                 idx = _luxriot_ensure_index()
                 if not idx:
@@ -2034,6 +3069,17 @@ def mcp_endpoint():
                     res = {"ready": False, "items": []}
                 else:
                     res = {"ready": True, "items": idx.search(q, k=k, doc=doc)}
+                return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
+
+            if name == "luxriot_docs_search_hybrid":
+                q = _arg_str("query", "")
+                k = _arg_int("k", 5)
+                doc = _arg_opt_str("doc")
+                idx = _luxriot_ensure_index()
+                if not idx:
+                    res = {"ready": False, "items": []}
+                else:
+                    res = {"ready": True, "items": idx.search_hybrid(q, k=k, doc=doc)}
                 return jsonify(_jsonrpc_result(_id, {"content": [{"type": "text", "text": json.dumps(res, ensure_ascii=False)}]}))
 
             if name == "luxriot_docs_get":
