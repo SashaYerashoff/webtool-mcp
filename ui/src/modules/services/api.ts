@@ -206,6 +206,23 @@ export async function deleteAnnotation(pairId: string, annId: string){
   return r.json();
 }
 
+export async function listPairsWithAnnotations(opts?: { sentiment?: 'positive'|'negative'|''; agent?: string; limit?: number }){
+  const sp = new URLSearchParams();
+  if(opts?.sentiment) sp.set('sentiment', opts.sentiment);
+  if(opts?.agent) sp.set('agent', opts.agent);
+  if(opts?.limit) sp.set('limit', String(opts.limit));
+  const r = await fetch(`${REL_ROOT}/pairs/with_annotations?${sp.toString()}`);
+  if(!r.ok) throw new Error('pairs with annotations failed');
+  const data = await r.json();
+  return (data.items || []) as (PairListItem & { annotation_count: number })[];
+}
+
+export function exportAnnotationsDataset(format: 'jsonl'|'json' = 'jsonl'){
+  const url = `${REL_ROOT}/admin/annotations_export?format=${format}`;
+  // open in new tab to trigger download
+  window.open(url, '_blank');
+}
+
 // Luxriot status
 export async function getLuxriotStatus(){
   const r = await fetch(`${REL_ROOT}/luxriot/status`);

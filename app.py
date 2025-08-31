@@ -760,6 +760,52 @@ def http_delete_pair(pid: str):
         return jsonify({"deleted": False, "error": "not found"}), 404
     return jsonify({"deleted": True, "id": pid})
 
+@app.get('/pairs/with_annotations')
+def http_pairs_with_annotations():
+    sentiment = (request.args.get('sentiment') or '').strip().lower()  # '', 'positive', 'negative'
+    agent = request.args.get('agent') or None
+    try:
+        limit = int(request.args.get('limit') or '20')
+    except Exception:
+        limit = 20
+    with _DB_LOCK:
+        con = _db_conn()
+        try:
+            cur = con.cursor()
+            base_sql = (
+                "SELECT p.id, p.created_at, p.agent_type, p.user_request, p.model_response, p.topic, COUNT(a.id) as acount "
+                "FROM pairs p JOIN pair_annotations a ON a.pair_id = p.id "
+            )
+            where = []
+            params: list[typing.Any] = []
+            if agent:
+                where.append("p.agent_type = ?")
+                params.append(agent)
+            if sentiment in ("positive", "negative"):
+                where.append("(a.sentiment = ?)")
+                params.append(sentiment)
+            sql = base_sql
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " GROUP BY p.id ORDER BY p.created_at DESC LIMIT ?"
+            params.append(limit)
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        finally:
+            con.close()
+    items = []
+    for r in rows:
+        items.append({
+            "id": r[0],
+            "created_at": r[1],
+            "agent_type": r[2],
+            "user_request": r[3],
+            "model_response": r[4],
+            "topic": r[5],
+            "annotation_count": r[6],
+        })
+    return jsonify({"items": items, "sentiment": sentiment or "any"})
+
 @app.post('/pairs/<pid>/annotations')
 def http_create_annotation(pid: str):
     body = request.get_json(silent=True) or {}
