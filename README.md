@@ -18,6 +18,11 @@ Tools currently exposed:
 | `luxriot_docs_status` | Status of Luxriot manuals index (ready, files, chunks). |
 | `luxriot_docs_search` | BM25 search across Luxriot manuals (query, k?, doc?). |
 | `luxriot_docs_get` | Get full text of a matched chunk by chunk_id. |
+| `pairs_*` | Save/search conversation pairs; annotate spans; export datasets and summary. |
+| `vision_status` | Check availability of SigLIP embeddings and OCR. |
+| `vision_encode` | Index an image (URL or base64) with SigLIP embedding + OCR. |
+| `vision_search` | Text→image semantic search across indexed images. |
+| `vision_extract_from_url` | Fetch a page, extract top images, index with embedding + OCR. |
 
 All tools are discoverable through the MCP `tools/list` (or `tools.list`) JSON-RPC method.
 
@@ -127,6 +132,8 @@ npm install
 npm run dev  # http://localhost:5173
 ```
 
+Ensure the UI can reach backend routes via Vite proxy (already included). If adding new routes, update `ui/vite.config.ts` accordingly.
+
 Configure endpoints before starting proxy if non-default:
 ```bash
 export LM_STUDIO_BASE=http://localhost:1234
@@ -155,6 +162,8 @@ Ask the model: "List the tools you have." It should respond (or you can request 
 See `sysprompt.md` for the fully maintained prompt (ranking heuristics, fallbacks, efficiency rules). Minimal inline guidance:
 
 > Broad topic → `web_search` (multi) → choose URL → `fetch_url(mode='outline')` → pick `chunk_id` OR `link_id` → summarize with cited sources before deeper retrieval.
+
+Vision tool usage is also documented in `sysprompt.md` with JSON call examples.
 
 ## Manual Testing (curl examples)
 
@@ -249,6 +258,66 @@ On first use, the server builds a lightweight BM25 index in memory. Tools:
 - luxriot_docs_status
 - luxriot_docs_search { query, k?=5, doc? }
 - luxriot_docs_get { chunk_id }
+
+## Vision (SigLIP + OCR) – Local Setup
+
+Goal: Give a text‑only LLM vision capabilities via tools. You can run embeddings (SigLIP) and OCR locally.
+
+1) System OCR
+```bash
+sudo apt-get update
+sudo apt-get install -y tesseract-ocr  # and languages as needed, e.g. tesseract-ocr-all
+```
+
+2) Python deps (in your venv)
+```bash
+pip install Pillow pytesseract transformers sentencepiece protobuf numpy
+# Torch (choose ONE):
+# CPU-only
+pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+# NVIDIA CUDA 12.1 (example)
+# pip install --index-url https://download.pytorch.org/whl/cu121 torch torchvision
+```
+
+3) Choose a SigLIP model and start the server
+```bash
+export WEBTOOL_VISION_MODEL=google/siglip-base-patch16-224
+# or larger:
+# export WEBTOOL_VISION_MODEL=google/siglip-so400m-patch14-384
+python app.py
+```
+
+4) Verify
+```bash
+curl -s http://localhost:5000/vision/status | jq
+# expect: ready:true, has_ocr:true, model: "google/siglip-..."
+```
+
+5) Smoke test
+```bash
+curl -s -X POST http://localhost:5000/vision/encode \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://upload.wikimedia.org/wikipedia/commons/3/3a/Cat03.jpg"}' | jq
+
+curl -s -X POST http://localhost:5000/vision/search \
+  -H 'Content-Type: application/json' \
+  -d '{"q":"a cat","limit":5}' | jq
+```
+
+Notes:
+- First call downloads model weights to your HF cache (set `HF_HOME` to change location).
+- OCR is optional; embeddings enable visual search. OCR is used when text exists.
+- We filter OCR noise; empty/garbled text won’t pollute results.
+
+### Vision via the UI
+- The Sidebar shows Vision status. You can Extract images from a URL, Upload a file, and Search by text.
+- In OCR‑only mode, Extract/Upload is still enabled; Search requires SigLIP loaded.
+
+### Troubleshooting
+- SentencePiece error: `pip install -U sentencepiece protobuf`
+- Ready=false: ensure `WEBTOOL_VISION_MODEL` is exported in the same terminal as Flask.
+- Memory errors: switch to the smaller model (`siglip-base-patch16-224`).
+- Vite can’t reach backend: ensure `/vision` is proxied in `ui/vite.config.ts`.
 
 ## JSON-RPC Notes
 

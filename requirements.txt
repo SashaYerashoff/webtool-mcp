@@ -8,3 +8,7 @@ Pillow
 transformers
 torch
 pytesseract
+sentencepiece
+protobuf
+numpy
+sentence-transformers
