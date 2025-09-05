@@ -450,6 +450,20 @@ def _ocr_image(pil_img) -> str | None:
     """
     if pytesseract is None or pil_img is None:
         return None
+
+    def _ocr_clean(s: str) -> str:
+        s = _collapse(s)
+        if not s:
+            return ''
+        if len(s) < 3:
+            return ''
+        alnum = sum(ch.isalnum() for ch in s)
+        ratio = alnum / max(1, len(s))
+        has_word3 = any(len(tok) >= 3 and any(c.isalpha() for c in tok) for tok in re.split(r"\W+", s))
+        if ratio < 0.4 and not has_word3:
+            return ''
+        return s
+
     try:
         img = pil_img
         # Flatten transparency to white background if present
@@ -498,7 +512,7 @@ def _ocr_image(pil_img) -> str | None:
         for conf in configs:
             try:
                 txt = pytesseract.image_to_string(img_bin, config=conf)
-                txt = _collapse(txt)
+                txt = _ocr_clean(txt)
                 if txt:
                     return txt
             except Exception:
@@ -506,7 +520,7 @@ def _ocr_image(pil_img) -> str | None:
         # Fallback on grayscale without binarization
         try:
             txt = pytesseract.image_to_string(img, config="--oem 3 --psm 6 -l eng")
-            txt = _collapse(txt)
+            txt = _ocr_clean(txt)
             if txt:
                 return txt
         except Exception:
@@ -515,7 +529,7 @@ def _ocr_image(pil_img) -> str | None:
     except Exception as e:
         app.logger.warning(f"OCR failed: {e}")
         try:
-            return _collapse(pytesseract.image_to_string(pil_img))
+            return _ocr_clean(pytesseract.image_to_string(pil_img))
         except Exception:
             return None
 
