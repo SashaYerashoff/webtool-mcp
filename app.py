@@ -49,9 +49,16 @@ app = Flask(__name__)
 
 # Optional vision deps (SigLIP via transformers, Pillow for image IO, pytesseract for OCR)
 try:
-    from PIL import Image  # type: ignore
+    from PIL import Image, ImageOps, ImageFilter  # type: ignore
 except Exception:
-    Image = None  # type: ignore
+    try:
+        from PIL import Image  # type: ignore
+        ImageOps = None  # type: ignore
+        ImageFilter = None  # type: ignore
+    except Exception:
+        Image = None  # type: ignore
+        ImageOps = None  # type: ignore
+        ImageFilter = None  # type: ignore
 try:
     import torch  # type: ignore
     from transformers import AutoProcessor, AutoModel  # type: ignore
@@ -434,12 +441,83 @@ def _open_image_from_bytes(data: bytes):
         return None
 
 def _ocr_image(pil_img) -> str | None:
+    """OCR with light preprocessing and multiple Tesseract configs.
+
+    Steps:
+    - Flatten alpha to white, grayscale, autocontrast
+    - Upscale small images, light denoise
+    - Binarize and try psm 6/7/11; fallback to grayscale
+    """
     if pytesseract is None or pil_img is None:
         return None
     try:
-        return pytesseract.image_to_string(pil_img)
-    except Exception:
-        return None
+        img = pil_img
+        # Flatten transparency to white background if present
+        try:
+            if Image is not None and img.mode in ("RGBA", "LA"):
+                bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+                img = Image.alpha_composite(bg, img.convert("RGBA")).convert("RGB")
+        except Exception:
+            pass
+        # Convert to grayscale
+        try:
+            img = img.convert("L")
+        except Exception:
+            pass
+        # Auto-contrast if available
+        try:
+            if ImageOps is not None:
+                img = ImageOps.autocontrast(img)
+        except Exception:
+            pass
+        # Upscale if small to help OCR
+        try:
+            w, h = img.size
+            if max(w, h) < 1000:
+                scale = 2 if max(w, h) >= 500 else 3
+                img = img.resize((w * scale, h * scale))
+        except Exception:
+            pass
+        # Light denoise
+        try:
+            if ImageFilter is not None:
+                img = img.filter(ImageFilter.MedianFilter(size=3))
+        except Exception:
+            pass
+        # Simple binarization
+        try:
+            img_bin = img.point(lambda x: 255 if x > 180 else 0, "1")
+        except Exception:
+            img_bin = img
+
+        configs = [
+            "--oem 3 --psm 6 -l eng",
+            "--oem 3 --psm 7 -l eng",
+            "--oem 3 --psm 11 -l eng",
+        ]
+        for conf in configs:
+            try:
+                txt = pytesseract.image_to_string(img_bin, config=conf)
+                txt = _collapse(txt)
+                if txt:
+                    return txt
+            except Exception:
+                continue
+        # Fallback on grayscale without binarization
+        try:
+            txt = pytesseract.image_to_string(img, config="--oem 3 --psm 6 -l eng")
+            txt = _collapse(txt)
+            if txt:
+                return txt
+        except Exception:
+            pass
+        return ''
+    except Exception as e:
+        app.logger.warning(f"OCR failed: {e}")
+        try:
+            return _collapse(pytesseract.image_to_string(pil_img))
+        except Exception:
+            return None
 
 def save_pair(session_id: str, agent_type: str, user_request: str, model_response: str, thinking: str | None, tool_use_log: list[dict] | None, parent_pair_id: str | None, topic: str | None):
     pid = str(uuid.uuid4())
