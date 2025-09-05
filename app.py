@@ -1990,19 +1990,10 @@ def vision_extract_from_url():
     if not url:
         return jsonify({"error": "url required"}), 400
     try:
-        res = fetch_url(url)
-        html = res.get('content') if isinstance(res, dict) else None
-        if not html:
-            return jsonify({"error": "failed to fetch base url"}), 400
-        soup = BeautifulSoup(html, 'html.parser')
-        imgs = _extract_images(soup, url)[:limit]
-        out = []
-        for img in imgs:
-            src = img.get('src')
-            if not src:
-                continue
+        # If the URL itself points to an image, index it directly.
+        if _IMG_EXT_RE.search(url):
             try:
-                r = requests.get(src, timeout=10)
+                r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0 webtool-mcp"})
                 r.raise_for_status()
                 data = r.content
                 pil = _open_image_from_bytes(data)
@@ -2010,14 +2001,57 @@ def vision_extract_from_url():
                 h = pil.height if pil is not None else None
                 vec = _siglip_image_embed(pil) if pil is not None else None
                 ocr_txt = _ocr_image(pil)
-                vid = _vision_save_item(src, r.headers.get('Content-Type'), w, h, ocr_txt, None, {"from": url}, vec)
-                out.append({"id": vid, "url": src, "width": w, "height": h, "ocr_text": ocr_txt or ''})
+                vid = _vision_save_item(url, r.headers.get('Content-Type'), w, h, ocr_txt, None, {"from": url}, vec)
+                return jsonify({"items": [{"id": vid, "url": url, "width": w, "height": h, "ocr_text": ocr_txt or ''}], "source": url})
+            except Exception as e:
+                app.logger.warning(f"direct image fetch/index failed for {url}: {e}")
+                return jsonify({"error": f"image fetch/index failed: {e}"}), 400
+
+        # Otherwise, treat as an HTML page: extract and rank images, then index top-k.
+        res = fetch_url(url)
+        html = res.get('content') if isinstance(res, dict) else None
+        if not html:
+            return jsonify({"error": "failed to fetch base url"}), 400
+        soup = BeautifulSoup(html, 'html.parser')
+        candidates = _extract_images(soup, url)
+        # Rank by thumbnail/photo suitability and take slightly more than limit to allow size filtering
+        ranked = _top_thumbnail_images(candidates, k=max(limit * 2, limit))
+        out = []
+        for img in ranked:
+            src = img.get('src')
+            if not src:
+                continue
+            try:
+                r = requests.get(src, timeout=10, headers={"User-Agent": "Mozilla/5.0 webtool-mcp"})
+                r.raise_for_status()
+                data = r.content
+                pil = _open_image_from_bytes(data)
+                w = pil.width if pil is not None else None
+                h = pil.height if pil is not None else None
+                # Skip tiny icons and placeholders
+                if (w or 0) < 120 or (h or 0) < 120:
+                    continue
+                vec = _siglip_image_embed(pil) if pil is not None else None
+                ocr_txt = _ocr_image(pil)
+                meta = {"from": url, "alt": img.get('alt') or '', "filename": img.get('filename') or ''}
+                vid = _vision_save_item(src, r.headers.get('Content-Type'), w, h, ocr_txt, None, meta, vec)
+                out.append({
+                    "id": vid,
+                    "url": src,
+                    "width": w,
+                    "height": h,
+                    "ocr_text": ocr_txt or '',
+                    "alt": img.get('alt') or '',
+                    "thumb_score": round(float(_score_image_for_thumb(img)), 3)
+                })
+                if len(out) >= limit:
+                    break
             except Exception as e:
                 app.logger.warning(f"image fetch/index failed for {src}: {e}")
                 continue
         return jsonify({"items": out, "source": url})
     except Exception as e:
-        return jsonify({"error": str(e)})
+        return jsonify({"error": str(e)}), 500
 
 @app.get('/admin/annotations_summary')
 def admin_annotations_summary():
