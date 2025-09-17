@@ -6,6 +6,7 @@ import { defineConfig } from 'vite';
 const rootDir = new URL('.', import.meta.url).pathname;
 
 export default defineConfig({
+  publicDir: 'img',
   build: {
     rollupOptions: {
       input: {

@@ -120,7 +120,19 @@ export default function App(){
         <div className="messages" ref={scrollRef}>
           {messages.map(m=> (
             <div key={m.id} className={"bubble "+m.role}>
-              {m.role==='assistant' ? <Markdown>{m.content}</Markdown> : <div className="whitespace-pre-wrap">{m.content}</div>}
+              {m.role==='assistant' ? (
+                <>
+                  <div style={{fontWeight:800, marginBottom:4}}>Evo AI</div>
+                  <Markdown>{m.content}</Markdown>
+                </>
+              ) : m.role==='user' ? (
+                <>
+                  <div style={{fontWeight:800, marginBottom:4}}>You</div>
+                  <div className="whitespace-pre-wrap">{m.content}</div>
+                </>
+              ) : (
+                <div className="whitespace-pre-wrap">{m.content}</div>
+              )}
             </div>
           ))}
         </div>
