@@ -2,8 +2,10 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { getSystemPrompt, streamChat, type ChatStreamEvent } from '../modules/services/api';
+import './mock.css';
 
 type Msg = { id: string; role: 'user'|'assistant'|'tool'; content: string };
+type Attachment = { name: string; type?: string; size?: number };
 
 export default function App(){
   const [messages, setMessages] = useState<Msg[]>([]);
@@ -12,6 +14,7 @@ export default function App(){
   const [systemPrompt, setSystemPrompt] = useState<string>('');
   const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
 
   useEffect(()=>{ getSystemPrompt().then(setSystemPrompt).catch(()=>{}); },[]);
   useEffect(()=>{ scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }); }, [messages]);
@@ -63,38 +66,88 @@ export default function App(){
     >{props.children}</ReactMarkdown>
   ), []);
 
+  const attachSummary = attachments.length ? `Attached: ${attachments.map(a=>a.name).slice(0,3).join(', ')}${attachments.length>3?` (+${attachments.length-3} more)`:''}` : '';
+
+  const prefill = (scope: string, tip: string)=>{
+    const suggest = `${scope}: ${tip || ''}`.trim();
+    setInput(suggest);
+  };
+
   return (
-    <div className="min-h-screen flex flex-col">
-      <header className="border-b px-4 py-3 flex items-center justify-between">
-        <div className="font-semibold">Evo Agent Client</div>
-        <div className="text-sm text-slate-500">Session: {sessionId ? sessionId.slice(0,8) : '—'}</div>
+    <div id="luxriot-agent" className="wrapper" role="application" aria-label="Luxriot support agent" data-theme="dark">
+      <header className="brand">
+        <div className="logo" aria-hidden="true"></div>
+        <div className="brand-name">Luxriot</div>
       </header>
-      <main className="flex-1 grid grid-rows-[1fr_auto]">
-        <div ref={scrollRef} className="overflow-auto px-4 py-4 space-y-4">
+
+      <main className="grid" aria-label="Topic shortcuts">
+        <section className="card" aria-labelledby="events-title" tabIndex={0} role="button" onClick={()=>prefill('Events & Actions','How to count cars on a parking lot?')}>
+          <h2 id="events-title">Events &amp; Actions</h2>
+          <p>I can help set scenarios, troubleshoot issues and answer questions. Don’t know what to start with?</p>
+          <small className="eyebrow">Scenario of the day: <em>How to count cars on a parking lot?</em></small>
+        </section>
+
+        <section className="card" aria-labelledby="devices-title" tabIndex={0} role="button" onClick={()=>prefill('Device Configuration','My camera is not in the list of supported, can I do smth?')}>
+          <h2 id="devices-title">Device Configuration</h2>
+          <p>Need to add a new camera? Understand how to set channels? What all those settings even mean? ONVIF? Troubleshoot?</p>
+          <small className="eyebrow">Here’s the starter: <em>My camera is not in the list of supported, can I do smth?</em></small>
+        </section>
+
+        <section className="card" aria-labelledby="server-title" tabIndex={0} role="button" onClick={()=>prefill('Server Configuration','How to set recording replication to the RAID in a different subnet?')}>
+          <h2 id="server-title">Server Configuration</h2>
+          <p>Don’t know what to do with the Recording server? Maybe you need to set disks? Looking for multi‑step troubleshoot to pinpoint an issue?</p>
+          <small className="eyebrow">Try this: <em>How to set recording replication to the RAID in a different subnet?</em></small>
+        </section>
+
+        <section className="card" aria-labelledby="services-title" tabIndex={0} role="button" onClick={()=>prefill('Services configuration','Can I add i‑PRO Active Guard to the Luxriot Evo S?')}>
+          <h2 id="services-title">Services configuration</h2>
+          <p>Access controls? External analytics? Something very special? I can help to solve misteries.</p>
+          <small className="eyebrow">Here’s the tip: <em>Can I add i‑PRO Active Guard to the Luxriot Evo S?</em></small>
+        </section>
+      </main>
+
+      <section className="assistant" aria-label="Assistant and message composer">
+        <div className="agent-card">
+          <div className="avatar" aria-hidden="true">AI</div>
+          <div>
+            <h3>Evo AI</h3>
+            <div className="sub">Hi! I am your support agent.</div>
+            <p className="sub intro">I am trained on an extensive range of Luxriot data and can answer a lot of your questions or help with multi‑step troubleshooting. Select a topic from the above or provide your issue description.</p>
+            <div className="agent-note">“I can make mistakes, but I am trying my best and constantly evolving.”</div>
+          </div>
+        </div>
+
+        <div className="messages" ref={scrollRef}>
           {messages.map(m=> (
-            <div key={m.id} className={m.role==='user' ? 'text-right' : ''}>
-              <div className={"inline-block max-w-3xl rounded-2xl px-4 py-2 " + (m.role==='user' ? 'bg-slate-900 text-white' : m.role==='tool' ? 'bg-amber-50 text-amber-900' : 'bg-slate-100')}>
-                {m.role==='assistant' ? <Markdown>{m.content}</Markdown> : <div className="whitespace-pre-wrap">{m.content}</div>}
-              </div>
+            <div key={m.id} className={"bubble "+m.role}>
+              {m.role==='assistant' ? <Markdown>{m.content}</Markdown> : <div className="whitespace-pre-wrap">{m.content}</div>}
             </div>
           ))}
-          {messages.length===0 && (
-            <div className="text-center text-slate-500 pt-10">Ask anything. The agent can browse, search, and use vision tools.</div>
-          )}
         </div>
-        <form className="border-t p-3 flex gap-2" onSubmit={(e)=>{e.preventDefault(); send();}}>
-          <textarea
-            className="flex-1 border rounded-md p-2 min-h-[44px] max-h-[160px]"
-            placeholder="Type your message..."
+
+        <form className="composer" onSubmit={(e)=>{e.preventDefault(); send();}}>
+          <label htmlFor="prompt" id="prompt-label" className="sr-only">Your prompt</label>
+          <textarea id="prompt" name="prompt" placeholder="Your prompt here:" aria-labelledby="prompt-label"
             value={input}
             onChange={(e)=>setInput(e.target.value)}
-            onKeyDown={(e)=>{
-              if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); send(); }
-            }}
-          />
-          <button type="submit" disabled={busy} className={"px-4 py-2 rounded-md text-white "+(busy?'bg-slate-400':'bg-slate-900 hover:bg-slate-800')}>{busy?'Sending…':'Send'}</button>
+            onKeyDown={(e)=>{ if((e.ctrlKey||e.metaKey) && e.key==='Enter'){ e.preventDefault(); send(); } }}
+          ></textarea>
+          <div className="right">
+            <div className="chips"><span>Attach:</span>
+              <button className="chip" type="button" onClick={()=>document.getElementById('file-screenshot')?.click()}>Screenshot</button>
+              <button className="chip" type="button" onClick={()=>document.getElementById('file-log')?.click()}>log</button>
+            </div>
+            <div className="attach-summary" aria-live="polite">{attachSummary}</div>
+            <button className="send" type="submit" aria-label="Send" disabled={busy}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M22 2L11 13"></path><path d="M22 2l-7 20-4-9-9-4 20-7z"></path></svg>
+              {busy ? 'SENDING…' : 'SEND'}
+            </button>
+          </div>
+          <input type="file" id="file-screenshot" accept="image/*" hidden onChange={(e)=>{ const fs = (e.target as HTMLInputElement).files; if(fs && fs.length) setAttachments(prev=>[...prev, ...Array.from(fs).map(f=>({name:f.name,type:f.type,size:f.size}))]); }} />
+          <input type="file" id="file-log" accept=".txt,.log,.zip,.gz,.tar,.json" hidden onChange={(e)=>{ const fs = (e.target as HTMLInputElement).files; if(fs && fs.length) setAttachments(prev=>[...prev, ...Array.from(fs).map(f=>({name:f.name,type:f.type,size:f.size}))]); }} />
         </form>
-      </main>
+        <p style={{marginTop:14, color:'var(--muted)'}}>Tip: Press <span className="kbd">Ctrl</span> + <span className="kbd">Enter</span> to send.</p>
+      </section>
     </div>
   );
 }

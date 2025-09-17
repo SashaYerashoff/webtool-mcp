@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Luxriot Support Agent – Mock</title>
+  <!-- Brand font -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Titillium+Web:wght@300;400;600;700;900&display=swap" rel="stylesheet">
+
+  <!-- =========================
+       TOKENS / BASE (extract to tokens.css)
+       ========================= -->
+  <style data-layer="tokens">
+    :root {
+      /* Shared brand tokens */
+      --font-family: "Titillium Web", Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      --radius-xl: 18px; --radius-lg: 14px; --radius-md: 10px;
+      --shadow-1: 0 20px 40px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.02);
+      --accent: #14d7ff; --accent-2: #2ee3b8; --warning: #f7b733;
+      --space-1: 6px; --space-2: 10px; --space-3: 16px; --space-4: 24px; --space-5: 32px;
+
+      /* Defaults (will be overridden by theme) */
+      /*--bg: #07181d;*/ background-image: url("/home/sasha/Projects/webtool/ui/img/earthrise.jpg"); --bg-elev: #0c242b; --card: rgba(10,35,41,.65);
+      --border: #133941; --text: #cde7ee; --muted: #8eb3bb;
+    }
+
+    /* Light theme */
+    [data-theme="light"] {
+      --bg: #f5fbfd; --bg-elev: #ffffff; --card: rgba(255,255,255,.72);
+      --border: #c6dde1; --text: #092a32; --muted: #5c7c84;
+      color-scheme: light;
+    }
+
+    /* Dark theme */
+    [data-theme="dark"] {
+      --bg: #07181d; --bg-elev: #0c242b; --card: rgba(10,35,41,.65);
+      --border: #133941; --text: #cde7ee; --muted: #8eb3bb;
+      color-scheme: dark;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      /* slightly larger base size */
+      font: 16.5px/1.55 var(--font-family);
+      letter-spacing: .2px;
+      background:
+        radial-gradient(1200px 600px at 10% -10%, color-mix(in oklab, var(--accent) 25%, transparent), transparent 60%),
+        radial-gradient(900px 500px at 90% 0%, color-mix(in oklab, var(--accent-2) 25%, transparent), transparent 70%),
+        linear-gradient(180deg, color-mix(in oklab, var(--bg) 96%, black), var(--bg));
+      color: var(--text);
+    }
+
+    /* Utilities */
+    .sr-only { position: absolute !important; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .kbd { font-variant-numeric: tabular-nums; background: color-mix(in oklab, var(--text) 8%, transparent); border: 1px solid var(--border); padding: 2px 6px; border-radius: 6px; font-size: .92em; }
+
+    :focus-visible { outline: 2px solid color-mix(in oklab, var(--accent) 70%, white); outline-offset: 2px; border-radius: 6px; }
+
+    .wrapper { max-width: 1200px; margin: 0 auto; padding: 28px 20px 120px; position: relative; }
+  </style>
+
+  <!-- =========================
+       COMPONENTS (extract to components.css)
+       ========================= -->
+  <style data-layer="components">
+    /* Header */
+    .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
+    .logo { width: 42px; height: 42px; border-radius: 8px; background: conic-gradient(from 200deg, var(--accent), var(--accent-2), var(--accent)); filter: saturate(120%); box-shadow: 0 6px 16px color-mix(in oklab, var(--accent) 25%, transparent); }
+    .brand-name { font-size: clamp(24px, 2.4vw, 30px); font-weight: 900; letter-spacing: .4px; }
+
+    /* Tiles */
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-1); padding: var(--space-4) 26px; backdrop-filter: blur(6px); position: relative; overflow: hidden; cursor: pointer; }
+    .card:after { content: ""; position: absolute; inset: -2px -2px auto auto; width: 140px; height: 140px; background: radial-gradient(100px 80px at 100% 0%, color-mix(in oklab, var(--accent) 20%, transparent), transparent 70%); pointer-events: none; }
+    .card h2 { margin: 0 0 10px; font-size: clamp(28px, 2.2vw, 34px); line-height: 1.1; color: var(--accent); font-weight: 900; letter-spacing: .3px; text-shadow: 0 0 12px color-mix(in oklab, var(--accent) 16%, transparent); }
+    .card p { color: var(--text); margin: 6px 0 0; }
+    .card small { color: var(--muted); display: inline-block; margin-top: 10px; }
+    .eyebrow { color: var(--muted); font-weight: 600; }
+    .eyebrow em { color: var(--text); font-style: normal; opacity: .9; }
+
+    /* Assistant & composer */
+    .assistant { display: grid; grid-template-columns: 1fr; gap: 16px; align-items: start; margin-top: 24px; }
+    .agent-card { /* minimalist per mock; keep these commented to re-enable chrome */
+      /*background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-1);*/
+      padding: 18px 20px; display: grid; grid-template-columns: 56px 1fr; gap: 14px; align-items: center;
+    }
+    .avatar { width: 56px; height: 56px; border-radius: 50%; background: radial-gradient(circle at 30% 30%, var(--accent-2), var(--accent) 60%, #0a6c86 100%); display: grid; place-items: center; color: #021b22; font-weight: 900; box-shadow: 0 10px 25px color-mix(in oklab, var(--accent) 30%, transparent); }
+    .agent-card h3 { margin: 0; font-size: 20px; font-weight: 900; letter-spacing: .2px; }
+    .agent-card .sub { color: var(--muted); font-size: 14px; margin-top: 4px; }
+    .agent-card .intro { margin-top: 8px; }
+    .agent-note { color: var(--muted); font-size: 12px; margin-top: 6px; font-style: italic; }
+
+    .composer { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 16px; min-height: 96px; display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 12px; box-shadow: var(--shadow-1); position: relative; }
+    .composer.is-dragover { outline: 2px dashed color-mix(in oklab, var(--accent) 45%, transparent); outline-offset: 4px; }
+
+    .composer textarea { width: 100%; min-height: 64px; max-height: 220px; resize: vertical; padding: 14px; border-radius: var(--radius-lg); border: 1px solid var(--border); background: color-mix(in oklab, black 20%, transparent); color: var(--text); outline: none; font: inherit; }
+    [data-theme="light"] .composer textarea { background: color-mix(in oklab, white 40%, transparent); }
+    .composer textarea::placeholder { color: color-mix(in oklab, var(--muted) 90%, transparent); }
+
+    .composer .right { display: grid; grid-template-rows: auto auto; gap: 10px; align-items: end; justify-items: end; }
+    .chips { display: flex; gap: 8px; align-items: center; color: var(--muted); font-size: 13px; }
+    .chip { padding: 6px 10px; border-radius: 999px; border: 1px solid var(--border); background: color-mix(in oklab, var(--bg-elev) 70%, transparent); cursor: pointer; user-select: none; }
+    .chip[aria-pressed="true"] { box-shadow: inset 0 0 0 2px color-mix(in oklab, var(--accent) 65%, transparent); }
+
+    .send { display: inline-flex; align-items: center; gap: 10px; padding: 12px 18px; border-radius: 14px; border: 1px solid color-mix(in oklab, var(--accent) 30%, #0e4954); background: linear-gradient(180deg, color-mix(in oklab, var(--accent) 20%, var(--bg-elev)), color-mix(in oklab, var(--bg-elev) 92%, black)); color: #e8fbff; font-weight: 900; letter-spacing: .3px; text-transform: uppercase; cursor: pointer; box-shadow: 0 10px 22px color-mix(in oklab, var(--accent) 22%, transparent), inset 0 1px 0 rgba(255,255,255,.05); transition: transform .05s ease-in-out, box-shadow .2s ease; }
+    [data-theme="light"] .send { color: #04232a; }
+    .send svg { width: 18px; height: 18px; }
+    .send:hover { box-shadow: 0 12px 28px color-mix(in oklab, var(--accent) 28%, transparent); }
+    .send:active { transform: translateY(1px); }
+
+    .attach-summary { color: var(--muted); font-size: 12px; margin-right: 2px; }
+
+    /* Responsive */
+    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } .assistant { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div id="luxriot-agent" class="wrapper" role="application" aria-label="Luxriot support agent" data-theme="dark">
+    <header class="brand">
+      <div class="logo" aria-hidden="true"></div>
+      <div class="brand-name">Luxriot</div>
+    </header>
+
+    <main class="grid" aria-label="Topic shortcuts">
+      <section class="card" aria-labelledby="events-title" tabindex="0" role="button" data-scope="Events & Actions">
+        <h2 id="events-title">Events &amp; Actions</h2>
+        <p>I can help set scenarios, troubleshoot issues and answer questions. Don’t know what to start with?</p>
+        <small class="eyebrow">Scenario of the day: <em>How to count cars on a parking lot?</em></small>
+      </section>
+
+      <section class="card" aria-labelledby="devices-title" tabindex="0" role="button" data-scope="Device Configuration">
+        <h2 id="devices-title">Device Configuration</h2>
+        <p>Need to add a new camera? Understand how to set channels? What all those settings even mean? ONVIF? Troubleshoot?</p>
+        <small class="eyebrow">Here’s the starter: <em>My camera is not in the list of supported, can I do smth?</em></small>
+      </section>
+
+      <section class="card" aria-labelledby="server-title" tabindex="0" role="button" data-scope="Server Configuration">
+        <h2 id="server-title">Server Configuration</h2>
+        <p>Don’t know what to do with the Recording server? Maybe you need to set disks? Looking for multi‑step troubleshoot to pinpoint an issue?</p>
+        <small class="eyebrow">Try this: <em>How to set recording replication to the RAID in a different subnet?</em></small>
+      </section>
+
+      <section class="card" aria-labelledby="services-title" tabindex="0" role="button" data-scope="Services configuration">
+        <h2 id="services-title">Services configuration</h2>
+        <p>Access controls? External analytics? Something very special? I can help to solve misteries.</p>
+        <small class="eyebrow">Here’s the tip: <em>Can I add i‑PRO Active Guard to the Luxriot Evo S?</em></small>
+      </section>
+    </main>
+
+    <section class="assistant" aria-label="Assistant and message composer">
+      <div class="agent-card">
+        <div class="avatar" aria-hidden="true">AI</div>
+        <div>
+          <h3>Evo AI</h3>
+          <div class="sub">Hi! I am your support agent.</div>
+          <p class="sub intro">I am trained on an extensive range of Luxriot data and can answer a lot of your questions or help with multi‑step troubleshooting. Select a topic from the above or provide your issue description.</p>
+          <div class="agent-note">“I can make mistakes, but I am trying my best and constantly evolving.”</div>
+        </div>
+      </div>
+
+      <form class="composer" action="#" method="post" onsubmit="return false;">
+        <label for="prompt" id="prompt-label" class="sr-only">Your prompt</label>
+        <textarea id="prompt" name="prompt" placeholder="Your prompt here:" aria-labelledby="prompt-label"></textarea>
+        <div class="right">
+          <div class="chips"><span>Attach:</span>
+            <button class="chip" type="button" id="attach-screenshot" aria-pressed="false">Screenshot</button>
+            <button class="chip" type="button" id="attach-log" aria-pressed="false">log</button>
+          </div>
+          <div class="attach-summary" id="attach-summary" aria-live="polite"></div>
+          <button class="send" type="submit" id="send" aria-label="Send">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 2L11 13"></path>
+              <path d="M22 2l-7 20-4-9-9-4 20-7z"></path>
+            </svg>
+            SEND
+          </button>
+        </div>
+        <!-- Hidden file inputs -->
+        <input type="file" id="file-screenshot" accept="image/*" hidden>
+        <input type="file" id="file-log" accept=".txt,.log,.zip,.gz,.tar,.json" hidden>
+      </form>
+    </section>
+
+    <p style="margin-top:14px; color:var(--muted)">Tip: Press <span class="kbd">Ctrl</span> + <span class="kbd">Enter</span> to send.</p>
+  </div>
+
+  <!-- =========================
+       APP LOGIC (extract to app.js)
+       ========================= -->
+  <script type="module" data-layer="app">
+    (function() {
+      const root = document.getElementById('luxriot-agent');
+      const composer = root.querySelector('.composer');
+      const textarea = root.querySelector('#prompt');
+      const sendBtn = root.querySelector('#send');
+      const attachSummary = root.querySelector('#attach-summary');
+      const sections = [...root.querySelectorAll('.grid .card')];
+      const fileInputScreenshot = root.querySelector('#file-screenshot');
+      const fileInputLog = root.querySelector('#file-log');
+      const btnScreenshot = root.querySelector('#attach-screenshot');
+      const btnLog = root.querySelector('#attach-log');
+
+      // Attachments state (names only for now)
+      const state = { attachments: [] };
+
+      function updateSummary() {
+        if (!state.attachments.length) { attachSummary.textContent = ''; return; }
+        const list = state.attachments.map(a => a.name).slice(0, 3).join(', ');
+        const more = state.attachments.length > 3 ? ` (+${state.attachments.length - 3} more)` : '';
+        attachSummary.textContent = `Attached: ${list}${more}`;
+      }
+
+      function addFiles(files, sourceBtn) {
+        for (const f of files) state.attachments.push({ name: f.name, type: f.type, size: f.size });
+        if (sourceBtn) sourceBtn.setAttribute('aria-pressed', 'true');
+        updateSummary();
+      }
+
+      // Tile → prefill prompt
+      sections.forEach(sec => {
+        const scope = sec.getAttribute('data-scope') || '';
+        const tip = (sec.querySelector('small em')?.textContent || '').trim();
+        const suggest = tip ? `${scope}: ${tip}` : `${scope}: `;
+        const fire = () => { textarea.value = suggest; textarea.focus(); textarea.setSelectionRange(textarea.value.length, textarea.value.length); };
+        sec.addEventListener('click', fire);
+        sec.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fire(); } });
+      });
+
+      // Ctrl/Cmd + Enter to send
+      textarea.addEventListener('keydown', e => {
+        if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+          e.preventDefault(); sendBtn.click();
+        }
+      });
+
+      // Send handler → dispatch custom event for host app to intercept
+      sendBtn.addEventListener('click', () => {
+        const prompt = textarea.value.trim();
+        if (!prompt) { textarea.focus(); return; }
+        const detail = { prompt, attachments: state.attachments.slice(), timestamp: Date.now() };
+        const evt = new CustomEvent('evo:send', { detail, bubbles: true });
+        root.dispatchEvent(evt);
+        // Reset minimal UI state (keep text to allow edits if needed?)
+        textarea.value = '';
+        state.attachments = [];
+        btnScreenshot.setAttribute('aria-pressed', 'false');
+        btnLog.setAttribute('aria-pressed', 'false');
+        updateSummary();
+      });
+
+      // Attachment buttons
+      btnScreenshot.addEventListener('click', () => fileInputScreenshot.click());
+      btnLog.addEventListener('click', () => fileInputLog.click());
+      fileInputScreenshot.addEventListener('change', e => addFiles(e.target.files, btnScreenshot));
+      fileInputLog.addEventListener('change', e => addFiles(e.target.files, btnLog));
+
+      // Drag & drop
+      ['dragenter','dragover'].forEach(type => composer.addEventListener(type, e => { e.preventDefault(); composer.classList.add('is-dragover'); }));
+      ['dragleave','drop'].forEach(type => composer.addEventListener(type, e => { e.preventDefault(); if (type === 'drop' && e.dataTransfer?.files?.length) addFiles(e.dataTransfer.files); composer.classList.remove('is-dragover'); }));
+
+      // Theme: choose by prefers-color-scheme unless overridden
+      if (!root.hasAttribute('data-theme')) {
+        const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        root.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+      }
+
+      // Public toggle for host app
+      window.EvoAgentTheme = {
+        set(theme = 'dark') { root.setAttribute('data-theme', theme); },
+        get() { return root.getAttribute('data-theme'); }
+      };
+
+      // Debug: log outgoing events (remove in prod)
+      root.addEventListener('evo:send', e => console.log('[evo:send]', e.detail));
+    })();
+  </script>
+</body>
+</html>
+
