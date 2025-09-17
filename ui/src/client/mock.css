@@ -32,11 +32,11 @@ body.client-mock-theme {
 .wrapper { max-width: 1200px; margin: 0 auto; padding: 28px 20px 120px; position: relative; }
 .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 22px; }
 .logo { width: 42px; height: 42px; border-radius: 8px; background: conic-gradient(from 200deg, var(--accent), var(--accent-2), var(--accent)); filter: saturate(120%); box-shadow: 0 6px 16px color-mix(in oklab, var(--accent) 25%, transparent); }
-.brand-name { font-size: clamp(24px, 2.4vw, 30px); font-weight: 900; letter-spacing: .4px; }
+.brand-name { font-size: clamp(24px, 2.4vw, 30px); font-weight: 600; letter-spacing: .4px; }
 .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 26px; }
 .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xl); box-shadow: var(--shadow-1); padding: var(--space-4) 26px; backdrop-filter: blur(6px); position: relative; overflow: hidden; cursor: pointer; }
 .card:after { content: ""; position: absolute; inset: -2px -2px auto auto; width: 140px; height: 140px; background: radial-gradient(100px 80px at 100% 0%, color-mix(in oklab, var(--accent) 20%, transparent), transparent 70%); pointer-events: none; }
-.card h2 { margin: 0 0 10px; font-size: clamp(28px, 2.2vw, 34px); line-height: 1.1; color: var(--accent); font-weight: 900; letter-spacing: .3px; text-shadow: 0 0 12px color-mix(in oklab, var(--accent) 16%, transparent); }
+.card h2 { margin: 0 0 10px; font-size: clamp(28px, 2.2vw, 34px); line-height: 1.1; color: var(--accent); font-weight: 600; letter-spacing: .3px; text-shadow: 0 0 12px color-mix(in oklab, var(--accent) 16%, transparent); }
 .card p { color: var(--text); margin: 6px 0 0; }
 .card small { color: var(--muted); display: inline-block; margin-top: 10px; }
 .eyebrow { color: var(--muted); font-weight: 600; }
@@ -45,7 +45,7 @@ body.client-mock-theme {
 .agent-card { padding: 18px 20px; display: grid; grid-template-columns: 56px 1fr; gap: 14px; align-items: center; }
 .avatar { width: 56px; height: 56px; border-radius: 50%; background: radial-gradient(circle at 30% 30%, var(--accent-2), var(--accent) 60%, #0a6c86 100%); display: grid; place-items: center; color: #021b22; font-weight: 900; box-shadow: 0 10px 25px color-mix(in oklab, var(--accent) 30%, transparent); }
 .agent-card h3 { margin: 0; font-size: 20px; font-weight: 900; letter-spacing: .2px; }
-.agent-card .sub { color: var(--muted); font-size: 14px; margin-top: 4px; }
+.agent-card .sub { color: var(--muted); font-size: 18px; margin-top: 4px; }
 .agent-card .intro { margin-top: 8px; }
 .agent-note { color: var(--muted); font-size: 12px; margin-top: 6px; font-style: italic; }
 .composer { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-xl); padding: 16px; min-height: 96px; display: grid; grid-template-columns: 1fr auto; align-items: end; gap: 12px; box-shadow: var(--shadow-1); position: relative; }

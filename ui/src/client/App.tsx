@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { getSystemPrompt, streamChat, type ChatStreamEvent } from '../modules/services/api';
+import { getSystemPrompt, streamChat, sendChat, type ChatStreamEvent } from '../modules/services/api';
 import './mock.css';
 
 type Msg = { id: string; role: 'user'|'assistant'|'tool'; content: string };
@@ -26,7 +26,7 @@ export default function App(){
     const userMsg: Msg = { id: crypto.randomUUID(), role:'user', content: text };
     setMessages(prev=>[...prev, userMsg, { id: 'pending', role:'assistant', content: '' }]);
     setBusy(true);
-    const es = streamChat({ user: text, session_id: sessionId, system_prompt: systemPrompt || null, model: null }, (ev: ChatStreamEvent)=>{
+  const es = streamChat({ user: text, session_id: sessionId, system_prompt: systemPrompt || null, model: null }, async (ev: ChatStreamEvent)=>{
       if(ev.type === 'session'){
         setSessionId(ev.session_id);
       } else if(ev.type === 'assistant_token'){
@@ -47,8 +47,21 @@ export default function App(){
         setMessages(prev=> prev.map(m=> m.id==='pending' ? { ...m, id: crypto.randomUUID() } : m));
         setBusy(false);
       } else if(ev.type === 'error'){
-        setMessages(prev=>[...prev.filter(m=>m.id!=='pending'), { id: crypto.randomUUID(), role:'assistant', content: `Error: ${ev.message}` }]);
-        setBusy(false);
+        // Fallback: try non-streaming POST if SSE fails (e.g., proxy/SSE issues)
+        try{
+          const resp = await sendChat({ user: text, session_id: sessionId, system_prompt: systemPrompt || null, model: null });
+          const assistant = (resp as any)?.assistant || '';
+          setSessionId((resp as any)?.session_id || sessionId);
+          if(assistant){
+            setMessages(prev=> prev.map(m=> m.id==='pending' ? { ...m, id: crypto.randomUUID(), content: assistant } : m));
+          }else{
+            setMessages(prev=>[...prev.filter(m=>m.id!=='pending'), { id: crypto.randomUUID(), role:'assistant', content: `Error: ${ev.message}` }]);
+          }
+        }catch(err:any){
+          setMessages(prev=>[...prev.filter(m=>m.id!=='pending'), { id: crypto.randomUUID(), role:'assistant', content: `Error: ${ev.message}` }]);
+        }finally{
+          setBusy(false);
+        }
       }
     });
   };
